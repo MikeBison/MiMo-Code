@@ -11,7 +11,7 @@
 </p>
 
 <p align="center">
-  <a href="https://mimo.xiaomi.com/zh/mimocode">官网</a> | <a href="https://mimo.xiaomi.com/zh/blog/mimo-code-long-horizon">博客</a>
+  <a href="https://mimo.xiaomi.com/zh/mimocode">官网</a> | <a href="https://mimo.xiaomi.com/zh/blog/mimo-code-long-horizon">博客</a> | <a href="assets/readme/architecture.md">架构文档</a>
 </p>
 
 ---
@@ -239,6 +239,8 @@ bun install              # 安装依赖
 bun run dev              # 开发模式运行
 bun turbo typecheck      # 类型检查
 ```
+
+想深入了解项目的分层架构、模块职责和核心调用链路，请参阅[架构文档](assets/readme/architecture.md)。
 
 ---
 
