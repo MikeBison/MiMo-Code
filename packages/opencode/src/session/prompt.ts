@@ -194,13 +194,21 @@ function isExtensionPath(filePath: string): boolean {
 const elog = EffectLogger.create({ service: "session.prompt" })
 
 export interface Interface {
+  // 中断指定会话正在进行的 agent 循环(用户按 Esc / 点停止时调用)。
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
+  // 【对外主入口】处理一条用户消息:组装请求并驱动 agent 循环,最终返回助手消息。
   readonly prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts>
+  // 【核心】agent 自主循环本体:调模型 → 执行工具 → 把结果喂回 → 再循环,直到结束。
   readonly loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts>
+  // shell 模式入口:把一条 shell 风格的输入当作 prompt 处理。
   readonly shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts>
+  // 斜杠命令(如 /goal、/voice)入口:解析并执行自定义命令。
   readonly command: (input: CommandInput) => Effect.Effect<MessageV2.WithParts>
+  // 把含占位符的模板字符串解析成实际的消息 parts(给 command/shell 复用)。
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
+  // 清理"孤儿"助手消息:上次因崩溃/中断而没写完(无 completed)的残留消息。
   readonly sweepOrphanAssistants: (sessionID: SessionID) => Effect.Effect<void>
+  // 预测:根据当前会话内容生成一段预测/建议文本(辅助功能)。
   readonly predict: (input: { sessionID: SessionID }) => Effect.Effect<string>
 }
 
@@ -209,52 +217,65 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Se
 export const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const bus = yield* Bus.Service
-    const status = yield* SessionStatus.Service
-    const sessions = yield* Session.Service
-    const agents = yield* Agent.Service
-    const provider = yield* Provider.Service
-    const processor = yield* SessionProcessor.Service
-    const prune = yield* SessionPrune.Service
-    const checkpoint = yield* SessionCheckpoint.Service
-    const compaction = yield* SessionCompaction.Service
-    const config = yield* Config.Service
-    const plugin = yield* Plugin.Service
-    const commands = yield* Command.Service
-    const permission = yield* Permission.Service
-    const fsys = yield* AppFileSystem.Service
-    const mcp = yield* MCP.Service
-    const lsp = yield* LSP.Service
-    const registry = yield* ToolRegistry.Service
-    const truncate = yield* Truncate.Service
-    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner
-    const scope = yield* Scope.Scope
-    const instruction = yield* Instruction.Service
-    const state = yield* SessionRunState.Service
-    const goal = yield* Goal.Service
-    const taskGateState = yield* TaskGateState.Service
-    const taskRegistry = yield* TaskRegistry.Service
-    const revert = yield* SessionRevert.Service
-    const summary = yield* SessionSummary.Service
-    const sys = yield* SystemPrompt.Service
-    const llm = yield* LLM.Service
-    const actorRegistry = yield* ActorRegistry.Service
-    const inbox = yield* Inbox.Service
+    // 定义各个模块变量
+    // ============================================================================
+    // 第①段:取来本服务干活所需的全部依赖服务(每个 yield* 读作 await)。
+    // 这一长串体现了 prompt.ts 是"调度中枢"——它编排下面这些专门服务来完成工作。
+    // ============================================================================
+    const bus = yield* Bus.Service                    // 事件总线:发布/订阅会话事件(消息更新、出错等)
+    const status = yield* SessionStatus.Service        // 会话状态:设置 busy/idle 等运行状态
+    const sessions = yield* Session.Service            // 会话存取:创建/读取/更新会话与消息
+    const agents = yield* Agent.Service                // agent 注册表:按名字取 agent 定义(build/plan/explore…)
+    const provider = yield* Provider.Service           // 模型提供方:解析/获取大模型(provider/model)
+    const processor = yield* SessionProcessor.Service  // 处理器:处理模型返回的流式片段、落库
+    const prune = yield* SessionPrune.Service          // 裁剪:删除过期/多余的消息数据
+    const checkpoint = yield* SessionCheckpoint.Service // 检查点:跨会话记忆的存档(MEMORY/checkpoint)
+    const compaction = yield* SessionCompaction.Service // 压缩:上下文接近上限时压缩历史
+    const config = yield* Config.Service               // 配置:读取 mimocode 配置项
+    const plugin = yield* Plugin.Service               // 插件:触发插件钩子(如 system 提示变换)
+    const commands = yield* Command.Service            // 斜杠命令:获取/解析 /xxx 自定义命令
+    const permission = yield* Permission.Service       // 权限:工具调用的允许/询问/拒绝判定
+    const fsys = yield* AppFileSystem.Service           // 文件系统:读写文件的封装
+    const mcp = yield* MCP.Service                      // MCP:外部 Model Context Protocol 服务器的工具/资源
+    const lsp = yield* LSP.Service                      // LSP:语言服务器,提供代码符号/诊断等语义信息
+    const registry = yield* ToolRegistry.Service        // 工具注册表:汇总所有可用工具(read/edit/bash…)
+    const truncate = yield* Truncate.Service            // 截断:把过长的工具输出截断/落盘
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner // 子进程派生器:启动外部进程
+    const scope = yield* Scope.Scope                    // 作用域:管理资源生命周期(配合 finalizer 清理)
+    const instruction = yield* Instruction.Service      // 指令:加载项目级 instructions(AGENTS.md 等)
+    const state = yield* SessionRunState.Service        // 运行态:记录/取消会话当前的运行循环
+    const goal = yield* Goal.Service                    // 目标:/goal 停止条件与裁判判定
+    const taskGateState = yield* TaskGateState.Service  // 任务闸:控制任务执行的门控状态
+    const taskRegistry = yield* TaskRegistry.Service    // 任务注册表:任务树(T1/T1.1…)的增删查改
+    const revert = yield* SessionRevert.Service         // 回退:撤销某轮改动
+    const summary = yield* SessionSummary.Service       // 摘要:生成会话/消息摘要
+    const sys = yield* SystemPrompt.Service             // 系统提示:拼装 system prompt(环境、技能等)
+    const llm = yield* LLM.Service                      // LLM:真正向大模型发请求、收流式响应
+    const actorRegistry = yield* ActorRegistry.Service  // actor 注册表:子 agent(actor)的派生与管理
+    const inbox = yield* Inbox.Service                  // 收件箱:agent 间消息传递(send/drain)
 
     // Track sessions that have already shown the "loaded instructions" toast so we
     // surface it once per primary session rather than on every run-loop turn.
     const instructionsNotified = new Set<SessionID>()
 
-    // Late-bind prefix-capture helper so SessionCheckpoint.tryStartCheckpointWriter
-    // can call buildLLMRequestPrefix without forming a layer cycle
-    // (ToolRegistry → SessionCheckpoint → ToolRegistry). See prefix-capture-ref.ts.
-    // The closure resolves Agent.Info and Provider.Model internally so checkpoint.ts
-    // only needs to pass string IDs.
+    // ============================================================================
+    // capture:重建某个 agent 的"LLM 请求前缀"(系统提示 + 工具 + 历史消息),
+    // 供 checkpoint-writer 子 agent 在 fork 时复用,以对齐父 agent 的请求、命中
+    // 大模型的 prompt 缓存(省钱 + 提速)。
+    //
+    // 为什么用 prefixCaptureRef 这个"插槽"来晚绑定:checkpoint.ts 需要调用这里的
+    // 逻辑,但直接 import 会形成循环依赖(ToolRegistry → SessionCheckpoint →
+    // ToolRegistry)。于是把本函数塞进共享插槽,checkpoint.ts 只从插槽取用、
+    // 不直接 import,从而打破循环。详见 prefix-capture-ref.ts。
+    // ============================================================================
     const capture: typeof prefixCaptureRef.current = (input) =>
       Effect.gen(function* () {
+        // 兜底返回值:任一步骤失败就返回这个"空前缀",绝不让 capture 抛错中断调用方。
         const empty = { system: [] as string[], tools: {} as Record<string, AITool>, inheritedMessages: [] as ModelMessage[], parentPermission: [] as Permission.Ruleset }
+        // ① 按名字取 agent 定义(取不到就返回空前缀)。
         const ag = yield* agents.get(input.agentName).pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (!ag) return empty
+        // ② 取这次用的模型(取不到也返回空前缀)。
         const model = yield* provider
           .getModel(input.providerID as ProviderID, input.modelID as ModelID)
           .pipe(Effect.catch(() => Effect.succeed(undefined)))
@@ -263,16 +284,20 @@ export const layer = Layer.effect(
         // byte-identical to the runLoop's (which uses session.time.created), preserving
         // Anthropic cache parity. If the session can't be loaded we can't guarantee that
         // parity, so fall through to empty rather than emit a divergent date.
+        // (把 env 日期锚定到会话创建时间,使捕获前缀与 runLoop 字节一致,保持 Anthropic 缓存命中。)
         const captureSession = yield* sessions.get(input.sessionID).pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (!captureSession) return empty
+        // ③ 并行准备系统提示的三块来源:技能、运行环境信息、全局指令(instructions)。
         const [skills, env, instructions] = yield* Effect.all([
           sys.skills(ag),
           Effect.sync(() => sys.environment(model, captureSession.time.created)),
           instruction.system().pipe(Effect.orDie),
         ])
-        // (checkpoint-writer never requests json_schema output, so STRUCTURED_OUTPUT_SYSTEM_PROMPT
-        // is not included; parent's runLoop adds it conditionally based on user.format)
+        // (checkpoint-writer 不要求 json_schema 输出,所以这里不含结构化输出的系统提示;
+        //  那部分由父 agent 的 runLoop 根据 user.format 按需追加。)
+        // ④ 把三块来源拼成"附加的系统内容"。
         const additions = [...env, ...(skills ? [skills] : []), ...instructions.content]
+        // ⑤ 真正构建请求前缀;临时把 LLM、ToolRegistry 两个服务注入进去;失败仍回退空前缀。
         const prefix = yield* buildLLMRequestPrefix({
           sessionID: input.sessionID,
           agent: ag,
@@ -280,22 +305,29 @@ export const layer = Layer.effect(
           msgs: input.msgs as Parameters<typeof buildLLMRequestPrefix>[0]["msgs"],
           additions,
         }).pipe(
-          Effect.provideService(LLM.Service, llm),
-          Effect.provideService(ToolRegistry.Service, registry),
-          Effect.catch(() => Effect.succeed(empty)),
+          Effect.provideService(LLM.Service, llm), // 步骤①:注入 LLM 服务
+          Effect.provideService(ToolRegistry.Service, registry), // 步骤②:注入工具注册表
+          Effect.catch(() => Effect.succeed(empty)), // 步骤③:出错就回退空前缀
         )
+        // ⑥ 连同父 agent 的权限一起返回(fork 出来的子 agent 要按父权限过滤工具)。
         return { ...prefix, parentPermission: ag.permission }
       })
+    // 把上面这个函数塞进共享插槽,供 checkpoint.ts 取用。
     prefixCaptureRef.current = capture
+    // 添加销毁钩子，本服务销毁时,若插槽还指向我们这个 capture,就清空它,避免悬空引用。
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
         if (prefixCaptureRef.current === capture) prefixCaptureRef.current = undefined
       }),
     )
 
+    // runner:造一个"运行器/桥"(EffectBridge),用来把 Effect"计划"真正启动起来,
+    // 主要供下面 ops 暴露给 Effect 世界之外的调用方(actor 系统)使用。
     const runner = Effect.fn("SessionPrompt.runner")(function* () {
       return yield* EffectBridge.make()
     })
+    // ops:把本服务的几个能力包装成普通可调用对象,交给 actor(子 agent)系统使用。
+    // cancel 用 run.fork 在后台启动(不等结束);prompt/resolvePromptParts 直接转调。
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       const run = yield* runner()
       return {
@@ -305,6 +337,7 @@ export const layer = Layer.effect(
       } satisfies ActorPromptOps
     })
 
+    // cancel:中断指定会话——记日志,然后委托 state 服务去真正取消其运行循环。
     const cancel = Effect.fn("SessionPrompt.cancel")(function* (sessionID: SessionID) {
       yield* elog.info("cancel", { sessionID })
       yield* state.cancel(sessionID)
