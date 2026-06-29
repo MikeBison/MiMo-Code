@@ -11,6 +11,7 @@ playground
 tmp
 dist
 ts-dist
+*.tgz
 .turbo
 **/.serena
 .serena/
@@ -41,3 +42,6 @@ tsconfig.tsbuildinfo
 experiment/*.log
 experiment/last-outcome.json
 /experiment
+
+/mimoapi/
+/packages/opencode/src/ext

@@ -1,4 +1,5 @@
 import * as Tool from "./tool"
+import { RecoverableError } from "./recoverable"
 import DESCRIPTION from "./actor.txt"
 import SHELL_DESCRIPTION from "./actor.shell.txt"
 import { tokenize } from "./shell-tokenize"
@@ -271,7 +272,7 @@ export const ActorTool = Tool.define(
     const actorRegistry = yield* ActorRegistry.Service
     const checkpoint = yield* SessionCheckpoint.Service
     const waiter = yield* ActorWaiter.Service
-    const taskRegistry = yield* TaskRegistry.Service
+    const tasks = yield* TaskRegistry.Service
 
     // Resolve the Actor service through the late-bound spawnRef rather than as
     // a Layer dependency: pulling Actor.Service in here would create a layer
@@ -631,7 +632,11 @@ export const ActorTool = Tool.define(
 
         const next = yield* agent.get(op.subagent_type)
         if (!next) {
-          return yield* Effect.fail(new Error(`Unknown agent type: ${op.subagent_type} is not a valid agent type`))
+          return yield* Effect.fail(
+            new RecoverableError(
+              `Unknown agent type "${op.subagent_type}". Valid subagent_type values are listed in the actor tool description — pass one of those.`,
+            ),
+          )
         }
 
         let prompt = op.prompt
@@ -681,7 +686,7 @@ export const ActorTool = Tool.define(
             effectiveTaskId = undefined
             taskNotice = `note: task_id "${op.task_id}" is not a valid task ID (expected Tn or Tn.m); ran ad-hoc. Task IDs come from the \`task\` tool.`
           } else {
-            const existing = yield* taskRegistry.get({ session_id: ctx.sessionID, id: op.task_id })
+            const existing = yield* tasks.get({ session_id: ctx.sessionID, id: op.task_id })
             if (!existing) {
               effectiveTaskId = undefined
               taskNotice = `note: task_id "${op.task_id}" does not exist in this session; ran ad-hoc. Create it with the \`task\` tool first, or omit task_id.`

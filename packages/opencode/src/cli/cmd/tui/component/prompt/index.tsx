@@ -43,6 +43,7 @@ import { useTextareaKeybindings } from "../textarea-keybindings"
 import { DialogSkill } from "../dialog-skill"
 import { DialogWorkspaceCreate, restoreWorkspaceSession } from "../dialog-workspace-create"
 import { DialogWorkspaceUnavailable } from "../dialog-workspace-unavailable"
+import { DialogAgreement, FREE_AGREEMENT_KEY, FREE_MODEL_IDS } from "../dialog-agreement"
 import { useArgs } from "@tui/context/args"
 
 export type PromptProps = {
@@ -125,7 +126,7 @@ export function Prompt(props: PromptProps) {
   const kv = useKV()
   const animationsEnabled = createMemo(() => kv.get("animations_enabled", true))
   const voiceEnabled = createMemo(() => kv.get("voice_enabled", false))
-  const voiceSendEnabled = createMemo(() => kv.get("voice_send_command", true))
+  const voiceSendEnabled = createMemo(() => kv.get("voice_send_command", false))
   const voiceControlEnabled = createMemo(() => kv.get("voice_control_enabled", false))
   const [voiceState, setVoiceState] = createSignal<"idle" | "listening" | "speaking" | "processing" | "finishing">(
     activeVoice ? (activeVoice.pending > 0 ? "processing" : "listening") : "idle",
@@ -226,18 +227,24 @@ export function Prompt(props: PromptProps) {
       return
     }
     if (state === "finishing") return
-    // Start streaming
-    const xiaomi = sync.data.provider.find((p) => p.id === "xiaomi")
-    if (!xiaomi?.key) {
-      toast.show({ message: t("tui.voice.error.no_auth"), variant: "error" })
+    // Start streaming — only validate the active mode's provider
+    const voiceConfig = sync.data.config.voice
+    const resolved = Voice.resolveVoiceConfig(voiceConfig)
+    const activeConfig = voiceControlEnabled() ? resolved.control : resolved.asr
+    const creds = Voice.resolveCredentials(sync.data.provider, activeConfig)
+    if ("error" in creds) {
+      const vars = { provider: creds.providerID, model: creds.model }
+      const msg = !voiceConfig ? t("tui.voice.error.no_auth")
+        : creds.error === "not_found" ? t("tui.voice.error.provider_not_found", vars)
+        : creds.error === "no_url" ? t("tui.voice.error.no_url", vars)
+        : t("tui.voice.error.no_auth_provider", vars)
+      toast.show({ message: msg, variant: "error" })
       return
     }
     if (!Voice.isAvailable()) {
       toast.show({ message: t("tui.voice.error.no_recorder"), variant: "error" })
       return
     }
-    const apiKey = xiaomi.key
-    const baseUrl = (xiaomi.options?.baseURL as string) || "https://api.xiaomimimo.com/v1"
 
     const av: NonNullable<typeof activeVoice> = {
       handle: undefined!,
@@ -269,8 +276,9 @@ export function Prompt(props: PromptProps) {
 
               const ctrl = await Voice.processVoiceControl({
                 audio: segment.audio,
-                apiKey,
-                baseUrl,
+                apiKey: creds.apiKey,
+                baseUrl: creds.baseUrl,
+                model: resolved.control.model,
                 currentText,
                 currentAgent,
                 availableAgents,
@@ -292,15 +300,17 @@ export function Prompt(props: PromptProps) {
               }
             } finally {
               av.pending--
-              if (activeVoice === av) av.setState("listening")
+              if (activeVoice === av && voiceState() !== "speaking")
+                av.setState(av.pending > 0 ? "processing" : "listening")
               if (!activeVoice && av.pending <= 0) av.setState("idle")
             }
           }).catch(() => {})
         } else {
           Voice.transcribeAudio({
             audio: segment.audio,
-            apiKey,
-            baseUrl,
+            apiKey: creds.apiKey,
+            baseUrl: creds.baseUrl,
+            model: resolved.asr.model,
           }).then((text) => {
             if (text) {
               if (voiceSendEnabled() && Voice.SEND_RE.test(text.replace(/[\s。.!！？?，,]+$/g, "").trim())) {
@@ -312,11 +322,13 @@ export function Prompt(props: PromptProps) {
               av.showError(t("tui.voice.error.network"))
             }
             av.pending--
-            if (activeVoice === av) av.setState("listening")
+            if (activeVoice === av && voiceState() !== "speaking")
+              av.setState(av.pending > 0 ? "processing" : "listening")
             if (!activeVoice && av.pending <= 0) av.setState("idle")
           }).catch(() => {
             av.pending--
-            if (activeVoice === av) av.setState("listening")
+            if (activeVoice === av && voiceState() !== "speaking")
+              av.setState(av.pending > 0 ? "processing" : "listening")
             if (!activeVoice && av.pending <= 0) av.setState("idle")
           })
         }
@@ -324,8 +336,13 @@ export function Prompt(props: PromptProps) {
       onActiveChange: (active) => {
         if (active && activeVoice === av) av.setState("speaking")
       },
-      onError: () => {
-        av.showError(t("tui.voice.error.no_recorder"))
+      onError: (err) => {
+        const msg = err.message || ""
+        if (msg.includes("no default audio") || msg.includes("not found") || msg.includes("Cannot open") || msg.includes("ALSA")) {
+          av.showError(t("tui.voice.error.no_device"))
+        } else {
+          av.showError(`${t("tui.voice.error.recorder_failed")}: ${msg}`)
+        }
         activeVoice = undefined
         av.setState("idle")
       },
@@ -690,6 +707,23 @@ export function Prompt(props: PromptProps) {
         },
       },
       {
+        title: t("tui.command.consent.revoke.title"),
+        value: "consent.revoke",
+        category: "prompt",
+        slash: {
+          name: "revoke-consent",
+        },
+        onSelect: (dialog) => {
+          kv.delete(FREE_AGREEMENT_KEY)
+          dialog.clear()
+          toast.show({
+            message: t("tui.consent.revoked"),
+            variant: "info",
+            duration: 3000,
+          })
+        },
+      },
+      {
         title: voiceEnabled() ? t("tui.command.voice.toggle.title_on") : t("tui.command.voice.toggle.title_off"),
         value: "voice.toggle",
         category: "prompt",
@@ -959,7 +993,13 @@ export function Prompt(props: PromptProps) {
     },
   ])
 
+  // While the free-model agreement dialog is open, ignore any further submit()
+  // calls. Enter triggers submit twice (the input_submit keybind plus the
+  // textarea's deferred onSubmit), and without this guard the deferred call can
+  // interleave with the post-accept re-submit and drop the user's message.
+  let agreementPending = false
   async function submit() {
+    if (agreementPending) return false
     setGhost("")
     // IME: double-defer may fire before onContentChange flushes the last
     // composed character (e.g. Korean hangul) to the store, so read
@@ -981,6 +1021,25 @@ export function Prompt(props: PromptProps) {
     const selectedModel = local.model.current()
     if (!selectedModel) {
       void promptModelWarning()
+      return false
+    }
+
+    // Free models require a one-time acknowledgment of the terms and privacy
+    // policy. Gate submission until the user accepts; the flag is stored in KV.
+    const isFreeModel = FREE_MODEL_IDS.has(selectedModel.modelID)
+    if (isFreeModel && !kv.get(FREE_AGREEMENT_KEY)) {
+      agreementPending = true
+      DialogAgreement.show(dialog, {
+        onConfirm: () => {
+          kv.set(FREE_AGREEMENT_KEY, true)
+          void submit()
+        },
+        // Fires on any dismissal (confirm, cancel, esc, click-outside). Reset
+        // the guard here so submission is unblocked once the dialog is gone.
+        onClose: () => {
+          agreementPending = false
+        },
+      })
       return false
     }
 
