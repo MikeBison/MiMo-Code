@@ -11,7 +11,17 @@ import { Agent } from "../agent/agent"
 import { SYSTEM_SPAWNED_AGENT_TYPES } from "@/agent/config"
 import { Provider } from "../provider"
 import { ModelID, ProviderID } from "../provider/schema"
-import { type Tool as AITool, type ModelMessage, tool, jsonSchema, type ToolExecutionOptions, asSchema } from "ai"
+import {
+  type Tool as AITool,
+  type ModelMessage,
+  tool,
+  jsonSchema,
+  type ToolExecutionOptions,
+  asSchema,
+  generateText,
+  wrapLanguageModel,
+} from "ai"
+import { InstallationVersion } from "@/installation/version"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import { SessionPrune } from "./prune"
 import { SessionCheckpoint } from "./checkpoint"
@@ -463,39 +473,81 @@ export const layer = Layer.effect(
       if (assistants.some((m) => m.info.time.completed === undefined)) return ""
       const lastAssistant = assistants[assistants.length - 1]
 
+      // Context fed to the prediction: up to 3 most recent user queries
+      // (chronological) plus the latest assistant turn (which carries tool
+      // outputs + final assistant text). Earlier assistant turns are dropped
+      // to keep the prompt small.
+      const recentUsers = history.filter(real).slice(-3)
+      const contextMsgs = [...recentUsers, lastAssistant]
+
       const base = yield* agents.get("title")
       if (!base) return ""
-      // Reuse the lightweight title agent's settings but swap its prompt for the
-      // prediction prompt — its default ("output ONLY a thread title") would
-      // otherwise be prepended ahead of PREDICT_SYSTEM and win.
-      const ag = { ...base, prompt: PREDICT_SYSTEM }
-      const mdl = ag.modelRef
-        ? yield* provider.resolveModelRef(ag.modelRef, lastAssistant.info.providerID)
-        : ag.model
-          ? yield* provider.getModel(ag.model.providerID, ag.model.modelID)
+      const mdl = base.modelRef
+        ? yield* provider.resolveModelRef(base.modelRef, lastAssistant.info.providerID)
+        : base.model
+          ? yield* provider.getModel(base.model.providerID, base.model.modelID)
           : ((yield* provider.getSmallModel(lastAssistant.info.providerID)) ??
             (yield* provider.getModel(lastAssistant.info.providerID, lastAssistant.info.modelID)))
 
-      const msgs = yield* MessageV2.toModelMessagesEffect([lastUser, lastAssistant], mdl, { stripMedia: true })
-      const text = yield* llm
-        .stream({
-          agent: ag,
-          user: lastUser.info,
-          system: [],
-          small: true,
-          tools: {},
-          model: mdl,
-          sessionID: input.sessionID,
-          retries: 1,
+      // Side-channel call: bypass llm.stream so prediction stays out of the
+      // session trajectory and never triggers session-coupled plugin hooks
+      // (chat.params, chat.headers, system.transform, memory instructions,
+      // x-session-affinity). Still publishes Metrics.ModelCall so the
+      // prediction cost shows up in analytics.
+      const msgs = yield* MessageV2.toModelMessagesEffect(contextMsgs, mdl, { stripMedia: true })
+      const language = yield* provider.getLanguage(mdl)
+      const wrapped = wrapLanguageModel({
+        model: language,
+        middleware: [
+          {
+            specificationVersion: "v3" as const,
+            async transformParams(args) {
+              if (args.type === "generate" || args.type === "stream") {
+                // @ts-expect-error
+                args.params.prompt = ProviderTransform.message(args.params.prompt, mdl, {})
+              }
+              return args.params
+            },
+          },
+        ],
+      })
+      const started = Date.now()
+      const result = yield* Effect.tryPromise(() =>
+        generateText({
+          model: wrapped,
+          system: PREDICT_SYSTEM,
           messages: [...msgs, { role: "user", content: PREDICT_NUDGE }],
+          maxOutputTokens: ProviderTransform.maxOutputTokens(mdl),
+          temperature: mdl.capabilities.temperature ? 0.7 : undefined,
+          providerOptions: ProviderTransform.providerOptions(mdl, ProviderTransform.smallOptions(mdl)),
+          headers: {
+            ...mdl.headers,
+            "User-Agent": `mimocode/${InstallationVersion}`,
+          },
+          maxRetries: 1,
+        }),
+      ).pipe(
+        Effect.catchCause((cause) =>
+          elog.warn("predict failed", { error: Cause.pretty(cause) }).pipe(Effect.as(undefined)),
+        ),
+      )
+      if (!result) return ""
+
+      const u = Session.getUsage({ model: mdl, usage: result.usage, metadata: result.providerMetadata })
+      yield* bus
+        .publish(Metrics.ModelCall, {
+          sessionID: input.sessionID,
+          finish_reason: result.finishReason,
+          latency_ms: Date.now() - started,
+          cached_read_tokens: u.tokens.cache.read,
+          model_id: mdl.id,
+          provider: mdl.providerID,
+          total_tokens_in: u.tokens.input + u.tokens.cache.read + u.tokens.cache.write,
+          total_tokens_out: u.tokens.output + u.tokens.reasoning,
         })
-        .pipe(
-          Stream.filter((e): e is Extract<LLM.Event, { type: "text-delta" }> => e.type === "text-delta"),
-          Stream.map((e) => e.text),
-          Stream.mkString,
-          Effect.orElseSucceed(() => ""),
-        )
-      const cleaned = text
+        .pipe(Effect.ignore)
+
+      const cleaned = result.text
         .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
         .split("\n")
         .map((line) => line.trim())
@@ -2610,7 +2662,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             // the session layer out of the app-runtime module-init cycle
             // (prompt → app-runtime → AppLayer → SessionPrompt). Only loaded when a
             // trigger actually fires. Detached fire-and-forget on the full runtime.
-            if (dreamTrigger || distillTrigger) {
+            const needAppRuntime = dreamTrigger || distillTrigger || Flag.MIMOCODE_EXPERIMENTAL_CRON
+            if (needAppRuntime) {
               const { AppRuntime } = yield* Effect.promise(() => import("@/effect/app-runtime"))
               if (dreamTrigger) {
                 AppRuntime.runPromise(
@@ -2633,6 +2686,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     }),
                   ),
                 ).catch((err) => log.error("auto-distill prompt failed", { error: String(err) }))
+              }
+              // T18-bridge mount: fire CronBridge.start(sessionID, workspaceRoot)
+              // once per new top-level session boot. The bridge itself no-ops when
+              // MIMOCODE_EXPERIMENTAL_CRON is unset; the outer gate just skips the
+              // resolve cost in the common case. Mirrors auto-dream's detached
+              // dynamic-import pattern so prompt.ts stays out of the app-runtime
+              // module-init cycle. Bridge.start is idempotent via its `started`
+              // guard, and its Layer finalizer handles teardown on scope close.
+              if (Flag.MIMOCODE_EXPERIMENTAL_CRON) {
+                const workspaceRoot = (yield* InstanceState.context).worktree
+                const { CronBridge } = yield* Effect.promise(() => import("@/session/cron-bridge"))
+                AppRuntime.runPromise(
+                  CronBridge.use((b) => b.start(sessionID, workspaceRoot)),
+                ).catch((err) => log.error("cron-bridge start failed", { sessionID, error: String(err) }))
               }
             }
           }
@@ -2663,6 +2730,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               overflow: compactionPart?.overflow,
               agentID: lastUser.agentID,
             })
+            // cron-sentinel cache is invalidated via a SessionCompaction.Event
+            // .Compacted bus subscription inside cron-bridge — see
+            // `compaction.ts:468` publish + `cron-bridge.ts` subscribe pair.
+            // Covers this user-`/compact` path plus the overflow-boundary
+            // path in compaction.create.
             if (result === "stop") break
             continue
           }
@@ -3907,5 +3979,58 @@ const bashRegex = /!`([^`]+)`/g
 const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
 const placeholderRegex = /\$(\d+)/g
 const quoteTrimRegex = /^["']|["']$/g
+
+/**
+ * Fire seam for scheduled prompts (T18, spec [S5]).
+ *
+ * Funnels a cron/loop fire through the SAME entry point typed user prompts use:
+ * `SessionPrompt.Service.prompt`. The synthetic part carries `synthetic: true`
+ * (mimocode convention for `isMeta`) so transcript-preview surfaces can hide it,
+ * and `metadata.origin = { kind: "cron", taskId, kindOfTask }` so the TUI can
+ * render a clock icon. Sentinel expansion is intentionally NOT done here — T19
+ * will wrap `value` before this call.
+ */
+export type ScheduledPromptOrigin = {
+  kind: "cron"
+  taskId: string
+  kindOfTask: "cron" | "loop"
+  /**
+   * ISO-8601 timestamp of when the scheduler tick fired this task. Set by the
+   * cron bridge in `onFire`; persisted on the synthetic part's metadata so the
+   * TUI and downstream consumers can recover fire time without parsing the
+   * prepended text prefix.
+   */
+  firedAt?: string
+}
+
+export type InjectScheduledPromptInput = {
+  sessionID: SessionID
+  value: string
+  origin: ScheduledPromptOrigin
+  priority?: "later" | "next" | "now"
+  isMeta?: boolean
+}
+
+export const injectScheduledPrompt = (input: InjectScheduledPromptInput) =>
+  Effect.gen(function* () {
+    const sp = yield* Service
+    yield* Effect.asVoid(
+      sp.prompt({
+        sessionID: input.sessionID,
+        source: "hook",
+        parts: [
+          {
+            type: "text",
+            text: input.value,
+            synthetic: input.isMeta ?? true,
+            metadata: {
+              origin: input.origin,
+              priority: input.priority ?? "later",
+            },
+          },
+        ],
+      }),
+    )
+  })
 
 export * as SessionPrompt from "./prompt"
