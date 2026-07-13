@@ -110,10 +110,9 @@ import { shouldAutoDream, shouldAutoDistill, DREAM_TASK, DISTILL_TASK, AUTO_DREA
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
 
-// Recall-reminder hints, rendered in each tool's configured invocation style so
-// shell-mode sessions never see a JSON-shaped example (which primes models to
-// emit JSON and crash the shell parser). `memory` has no shell form, so it is
-// always JSON. Exported for unit testing.
+// 召回提醒的提示行，按每个工具配置的调用风格渲染，这样 shell 模式的会话就永远
+// 不会看到 JSON 形态的示例（那会诱导模型输出 JSON 并使 shell 解析器崩溃）。
+// `memory` 没有 shell 形态，所以它始终是 JSON。导出以便单元测试。
 export function recallHintLines(toolCfg: ToolStyleConfig | undefined): string[] {
   const taskHint =
     resolveInvocationStyle(toolCfg, "task") === "shell" ? "- task list" : `- task({ operation: "list" })`
@@ -121,32 +120,28 @@ export function recallHintLines(toolCfg: ToolStyleConfig | undefined): string[] 
     resolveInvocationStyle(toolCfg, "actor") === "shell"
       ? "- actor status <actor_id>"
       : `- actor({ operation: "status", actor_id: "<id>" })`
-  // memory has no shell form (no shell.parse) → always JSON.
+  // memory 没有 shell 形态（无 shell.parse）→ 始终是 JSON。
   return [`- memory({ operation: "search", query: "<keyword>" })`, taskHint, actorHint]
 }
 
 /**
- * Cap on goal-driven main-loop re-entries per turn — the safety valve against
- * a never-satisfiable condition burning tokens forever. Higher than spawned
- * actors' MAX_PRE_REACT (=3) because main-session goals are usually larger.
- * TODO: lift to mimocode.json config (e.g. session.maxGoalReact).
+ * 每一轮 goal 驱动的主循环重入次数上限——防止一个永远无法满足的条件无限烧 token 的
+ * 安全阀。比派生 actor 的 MAX_PRE_REACT（=3）更高，因为主会话的 goal 通常更大。
+ * TODO: 提升到 mimocode.json 配置（例如 session.maxGoalReact）。
  */
 const MAX_GOAL_REACT = 12
 
 /**
- * Number of consecutive finished assistant steps with an identical action
- * signature that trips the repeated-step nudge. Three in a row is a strong
- * signal the model is stuck repeating itself rather than making progress.
+ * 连续多少个已完成的助手步骤具有相同的 action 签名时，触发"重复步骤"提示。
+ * 连续三次是模型陷入自我重复、而非在取得进展的强烈信号。
  */
 const REPEATED_STEP_THRESHOLD = 3
 
 /**
- * Deterministic JSON serialization with sorted object keys, so that two
- * semantically-identical tool inputs produce the same string regardless of the
- * order the model happened to emit the keys in. `JSON.stringify` preserves
- * insertion order, and models routinely re-emit the same arguments with keys in
- * a different order (e.g. {url,format} vs {format,url}) — without this the
- * signatures would differ and the repeated-step check would miss real loops.
+ * 带有排序键的确定性 JSON 序列化，使两个语义相同的工具输入无论模型碰巧以何种键顺序
+ * 输出，都产生相同的字符串。`JSON.stringify` 会保留插入顺序，而模型经常以不同的键
+ * 顺序重新输出相同的参数（例如 {url,format} 与 {format,url}）——没有这一步，签名
+ * 就会不同，重复步骤检查就会漏掉真正的循环。
  */
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null"
@@ -160,13 +155,11 @@ function stableStringify(value: unknown): string {
 }
 
 /**
- * Stable signature for an assistant step's *action* — the tool calls it made
- * (name + key-order-independent input). Text and reasoning are excluded on
- * purpose: in a ReAct loop the model narrates each step in slightly different
- * words while taking the exact same action, and some models emit their
- * reasoning as plain text parts — counting either would mask the repeated
- * action we want to catch. Returns undefined when a step makes no tool calls
- * (e.g. a pure-text turn), since there is no repeated *action* to compare.
+ * 助手步骤中*动作*的稳定签名——即它发起的工具调用（名称 + 与键顺序无关的输入）。
+ * 文本和推理被有意排除在外：在 ReAct 循环里，模型会用略有不同的措辞叙述每个步骤，
+ * 但采取的却是完全相同的动作；而且有些模型会把推理当作纯文本 part 输出——把这两者
+ * 计入都会掩盖我们想捕捉的重复动作。当某步骤没有发起任何工具调用时（例如纯文本 turn）
+ * 返回 undefined，因为此时没有可比较的重复*动作*。
  */
 function stepSignature(parts: MessageV2.Part[]): string | undefined {
   const segments: string[] = []
@@ -180,21 +173,18 @@ function stepSignature(parts: MessageV2.Part[]): string | undefined {
 }
 
 /**
- * Debounce decision for the high-context-pressure memory-flush nudge.
+ * 高上下文压力下"内存刷写提示"的防抖判定。
  *
- * Returns true if a nudge (a text part containing `marker`) has already been
- * injected within the *current high-pressure episode*, where the episode is the
- * message window since the last checkpoint boundary.
+ * 如果在*当前高压力片段*内已经注入过一次提示（一个包含 `marker` 的文本 part），
+ * 则返回 true；这里的片段指自上一个 checkpoint 边界以来的消息窗口。
  *
- * Keying off the checkpoint boundary rather than a fixed message count is
- * deliberate: a single sustained high-pressure turn can emit many tool-call
- * steps — each its own message — so a fixed-size tail would let the
- * already-nudged message slide out of the window and re-fire the nudge
- * mid-turn. The boundary only advances when a checkpoint/rebuild actually
- * discards context, which is exactly when a fresh nudge becomes useful again.
+ * 以 checkpoint 边界而非固定消息数作为锚点是有意为之的：一个持续的高压力 turn 可能
+ * 发出许多工具调用步骤——每个都是独立的消息——所以固定大小的尾窗会让已提示过的
+ * 消息滑出窗口，从而在 turn 中途再次触发提示。只有当 checkpoint/rebuild 真正丢弃
+ * 上下文时边界才会前移，而那正是重新提示重新变得有用的时机。
  *
- * When `boundaryID` is undefined (no checkpoint yet) or is not found in `msgs`,
- * the whole conversation is treated as the current episode.
+ * 当 `boundaryID` 为 undefined（尚无 checkpoint）或在 `msgs` 中找不到时，
+ * 整个会话都被视为当前片段。
  */
 export function nudgedSinceBoundary(
   msgs: readonly MessageV2.WithParts[],
@@ -226,9 +216,9 @@ const TEXT_TOOL_CALL_RETRY_LIMIT = Flag.MIMOCODE_TEXT_TOOL_CALL_RETRY_LIMIT
 
 const log = Log.create({ service: "session.prompt" })
 
-// Hooks are NOT listed here: the plugin layer detects hook file changes
-// itself via mtime staleness checks (covers external editors too), so only
-// tools and skills need the write/edit-triggered registry reload.
+// 这里不列出 Hooks：插件层自己通过 mtime 过期检查来探测 hook 文件变化
+//（外部编辑器也能覆盖到），所以只有 tools 和 skills 需要在 write/edit 触发时
+// 重新加载注册表。
 function isExtensionPath(filePath: string): boolean {
   return /\/\.mimocode\/(tools?|skills?)\//.test(filePath)
 }
@@ -295,8 +285,8 @@ export const layer = Layer.effect(
     const actorRegistry = yield* ActorRegistry.Service  // actor 注册表:子 agent(actor)的派生与管理
     const inbox = yield* Inbox.Service                  // 收件箱:agent 间消息传递(send/drain)
 
-    // Track sessions that have already shown the "loaded instructions" toast so we
-    // surface it once per primary session rather than on every run-loop turn.
+    // 记录已经展示过"已加载指令"提示的会话，这样每个主会话只提示一次，
+    // 而不是在每一轮 run-loop 都提示。
     const instructionsNotified = new Set<SessionID>()
 
     // ============================================================================
@@ -321,11 +311,9 @@ export const layer = Layer.effect(
           .getModel(input.providerID as ProviderID, input.modelID as ModelID)
           .pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (!model) return empty
-        // Anchor the env date to the session's creation time so the captured prefix is
-        // byte-identical to the runLoop's (which uses session.time.created), preserving
-        // Anthropic cache parity. If the session can't be loaded we can't guarantee that
-        // parity, so fall through to empty rather than emit a divergent date.
-        // (把 env 日期锚定到会话创建时间,使捕获前缀与 runLoop 字节一致,保持 Anthropic 缓存命中。)
+        // 把 env 日期锚定到会话创建时间，使捕获到的前缀与 runLoop 的（它用 session.time.created）
+        // 字节一致，从而保持 Anthropic 缓存命中。如果会话无法加载，就无法保证这种一致性，
+        // 因此宁可回退到空前缀，也不发出一个不一致的日期。
         const captureSession = yield* sessions.get(input.sessionID).pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (!captureSession) return empty
         // ③ 并行准备系统提示的三块来源:技能、运行环境信息、全局指令(instructions)。
@@ -494,9 +482,9 @@ export const layer = Layer.effect(
       const lastUser = history[userIdx]
       if (lastUser.info.role !== "user") return ""
 
-      // Only the assistant turn that actually answered this user message counts.
-      // Bail if that turn is still running (an incomplete assistant after it),
-      // so we never pair the newest prompt with a stale/older result.
+      // 只有真正回答了这条用户消息的那个助手 turn 才算数。
+      // 如果那个 turn 仍在运行中（其后跟着一个未完成的助手消息），就直接放弃，
+      // 这样我们永远不会把最新的 prompt 和一个陈旧/更早的结果配对。
       const assistants = history
         .slice(userIdx + 1)
         .filter((m): m is MessageV2.WithParts & { info: MessageV2.Assistant } => m.info.role === "assistant")
@@ -504,10 +492,8 @@ export const layer = Layer.effect(
       if (assistants.some((m) => m.info.time.completed === undefined)) return ""
       const lastAssistant = assistants[assistants.length - 1]
 
-      // Context fed to the prediction: up to 3 most recent user queries
-      // (chronological) plus the latest assistant turn (which carries tool
-      // outputs + final assistant text). Earlier assistant turns are dropped
-      // to keep the prompt small.
+      // 喂给预测的上下文：最近至多 3 条用户查询（按时间顺序）加上最新的助手 turn
+      //（它携带了工具输出 + 助手最终文本）。更早的助手 turn 会被丢弃，以保持 prompt 精简。
       const recentUsers = history.filter(real).slice(-3)
       const contextMsgs = [...recentUsers, lastAssistant]
 
@@ -520,11 +506,9 @@ export const layer = Layer.effect(
           : ((yield* provider.getSmallModel(lastAssistant.info.providerID)) ??
             (yield* provider.getModel(lastAssistant.info.providerID, lastAssistant.info.modelID)))
 
-      // Side-channel call: bypass llm.stream so prediction stays out of the
-      // session trajectory and never triggers session-coupled plugin hooks
-      // (chat.params, chat.headers, system.transform, memory instructions,
-      // x-session-affinity). Still publishes Metrics.ModelCall so the
-      // prediction cost shows up in analytics.
+      // 旁路调用：绕过 llm.stream，使预测不进入会话轨迹，也不会触发与会话耦合的插件钩子
+      //（chat.params、chat.headers、system.transform、memory instructions、
+      // x-session-affinity）。仍会发布 Metrics.ModelCall，使预测成本体现在分析统计中。
       const msgs = yield* MessageV2.toModelMessagesEffect(contextMsgs, mdl, { stripMedia: true })
       const language = yield* provider.getLanguage(mdl)
       const wrapped = wrapLanguageModel({
@@ -644,10 +628,9 @@ ${entries}
         }
       }
 
-      // Explicit multi-skill mentions in free text ("/foo ... /bar ..."). This
-      // is separate from the SessionPrompt.command single-command path, which
-      // already wraps SKILL.md content itself. Guard against double-wrapping
-      // by checking whether userMessage.parts already contains such a block.
+      // 自由文本中显式提及多个 skill（"/foo ... /bar ..."）。这与 SessionPrompt.command
+      // 的单命令路径是分开的，后者已经自己包裹了 SKILL.md 内容。通过检查 userMessage.parts
+      // 是否已包含这样的块来防止重复包裹。
       const alreadyWrapped = userMessage.parts.some(
         (p) => p.type === "text" && p.text.startsWith('<skill_content name="'),
       )
@@ -852,10 +835,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       const run = yield* runner()
       const promptOps = yield* ops()
 
-      // Per-tool runtime whitelist: when the LLM call is being made on behalf
-      // of a registered actor (subagent or peer), look up the actor row and,
-      // if `actor.tools` is an array, reject calls to tools not in the
-      // whitelist. `INHERIT` and a missing actor row both mean full access.
+      // 按工具的运行时白名单：当 LLM 调用是代表一个已注册的 actor（子 agent 或对等 agent）
+      // 发起时，查找该 actor 记录；如果 `actor.tools` 是数组，则拒绝调用不在白名单里的工具。
+      // `INHERIT` 和缺失的 actor 记录都表示完全放行。
       const whitelistFor = Effect.fn("SessionPrompt.whitelistFor")(function* () {
         if (!input.agentID) return undefined
         const actor = yield* actorRegistry.get(input.session.id, input.agentID)
@@ -863,20 +845,18 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         return new Set(actor.tools)
       })
       const whitelist = yield* whitelistFor()
-      // Whether a permission ask must be non-interactive (fail clean, never hang):
-      // true for system-spawned actors (checkpoint-writer/dream/distill) AND any
-      // background actor such as compose workflow subagents (spawned as "general"
-      // + background:true). Scoped to THIS permission decision on purpose — not
-      // folded into the shared isSystemSpawned, which also gates memory
-      // instructions and checkpoint self-triggering for user background actors.
-      // Fall back to the agent-name check if the actor row is missing (race /
-      // unregistered) so a system actor can't slip through as interactive.
+      // 权限询问是否必须是非交互式的（干净失败，绝不挂起）：对系统派生的 actor
+      //（checkpoint-writer/dream/distill）以及任何后台 actor（例如以 "general" +
+      // background:true 派生的 compose 工作流子 agent）为 true。有意只作用于*本次*权限
+      // 决策——不并入共享的 isSystemSpawned，后者还会为用户后台 actor 把关 memory
+      // instructions 和 checkpoint 自触发。如果 actor 记录缺失（竞态 / 未注册），
+      // 回退到按 agent 名判断，这样系统 actor 就不会被当作交互式而漏过。
       const askActor = input.agentID
         ? yield* actorRegistry.get(input.session.id, input.agentID)
         : undefined
-      // Three-way permission-ask routing (see decideAskRouting): system agent ->
-      // auto-deny; orchestrator peer -> FORWARD for approval; other background ->
-      // auto-deny; normal -> interactive.
+      // 三路权限询问路由（见 decideAskRouting）：系统 agent -> 自动拒绝；
+      // 编排器对等 agent -> 转发（FORWARD）以请求审批；其他后台 -> 自动拒绝；
+      // 普通 -> 交互式。
       const askRouting = decideAskRouting({
         askActor: askActor
           ? {
@@ -932,8 +912,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 sessionID: input.session.id,
                 tool: { messageID: input.processor.message.id, callID: options.toolCallId },
                 ruleset: Agent.runtimePermission(input.agent, input.session.permission),
-                // System-spawned + non-peer background agents have no human to answer
-                // → fail clean, don't hang. Orchestrator peers FORWARD for approval.
+                // 系统派生 + 非对等的后台 agent 没有人类来回答
+                // → 干净失败，不要挂起。编排器对等 agent 则转发（FORWARD）以请求审批。
                 interactive: askInteractive,
                 ...(askForward ? { forward: askForward } : {}),
               },
@@ -1972,10 +1952,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
     const sweepOrphanAssistants = Effect.fn("SessionPrompt.sweepOrphanAssistants")(function* (sessionID: SessionID) {
       const msgs = yield* sessions.messages({ sessionID, agentID: "*" })
       const now = Date.now()
-      // 1 hour — must exceed Task 1's chunkMs (300s) plus Task 2's
-      // PERSISTENT_RETRY worst-case backoff (10 attempts × 5 min cap =
-      // 50 min) so a still-active in-flight request is never falsely
-      // swept while its retry chain is making progress.
+      // 1 小时——必须超过 Task 1 的 chunkMs（300s）加上 Task 2 的
+      // PERSISTENT_RETRY 最坏情况退避（10 次尝试 × 5 分钟上限 =
+      // 50 分钟），这样一个仍然活跃的在途请求就绝不会在其重试链
+      // 正取得进展时被错误清扫。
       const ORPHAN_AGE_MS = 3_600_000
       for (const m of msgs) {
         if (m.info.role !== "assistant") continue
@@ -2030,16 +2010,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID, agentID?: string) {
       if (agentID !== undefined) {
-        // Agent-scoped: return THIS agent's newest message (assistant preferred).
-        // Critical for concurrent same-session subagents — a session-wide lookup
-        // collapses concurrent actors' return values onto whichever finished last.
-        // messages() yields oldest-first/newest-last, so findLast picks the newest
-        // assistant and the last element is the newest message overall.
+        // 按 agent 作用域：返回*该* agent 最新的消息（优先助手消息）。
+        // 对同一会话内并发的子 agent 至关重要——会话级的查找会把并发 actor 的
+        // 返回值坍缩成"最后完成的那个"。messages() 按从旧到新（末尾最新）返回，
+        // 所以 findLast 取到最新的助手消息，最后一个元素则是整体最新的消息。
         const own = yield* sessions.messages({ sessionID, agentID })
         const lastAsst = own.findLast((m) => m.info.role === "assistant")
         if (lastAsst) return lastAsst
         if (own.length > 0) return own[own.length - 1]
-        // fall through to session-wide if this agent has no messages yet
+        // 如果该 agent 还没有任何消息，则回退到会话级查找
       }
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user", { agentID: "*" })
       if (Option.isSome(match)) return match.value
@@ -2060,33 +2039,30 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         let lastFinishedForPrune: MessageV2.Assistant | undefined
         let lastModelForPrune: Provider.Model | undefined
         let outputLengthContinuations = 0
-        // Shared local counter for "model finished but produced nothing usable"
-        // (think-only / empty). T04's generic-invalid retries reuse this same
-        // counter — do not add a second one. Local to runLoop so a fresh user
-        // turn resets it (no cross-message pollution), same as outputLengthContinuations.
+        // "模型完成了但没产出任何可用内容"（仅推理 / 空）的共享本地计数器。
+        // T04 的通用 invalid 重试复用这同一个计数器——不要再加第二个。局部于 runLoop，
+        // 这样新一轮用户 turn 会重置它（无跨消息污染），与 outputLengthContinuations 一致。
         let invalidContinuations = 0
         // structured-output 专用 retry：上限来自 lastUser.format.retryCount（默认 2），
         // 与 invalidContinuations（generic invalid）分离，互不污染。局部于 runLoop，
         // 新一轮用户 turn 自动归零。
         let structuredRetries = 0
-        // Bounded retries for text-form tool calls (model wrote a tool call as
-        // prose text instead of a structured tool_use). Local to runLoop so each
-        // fresh user turn starts clean.
+        // 针对文本形式工具调用（模型把工具调用写成了散文文本而非结构化的 tool_use）的
+        // 有限次重试。局部于 runLoop，这样每一轮新的用户 turn 都从干净状态开始。
         let textToolCallRetries = 0
         const resolvedAgentID = agentID ?? "main"
-        // Tracks plugin-driven cancellation (session.pre OR any session.userQuery.pre)
-        // so session.post reports outcome="cancelled" instead of "error".
+        // 跟踪由插件驱动的取消（session.pre 或任意 session.userQuery.pre），
+        // 使 session.post 报告 outcome="cancelled" 而非 "error"。
         let cancelled = false
         let cancelReason: string | undefined
 
-        // Fires session.post exactly once via Effect.onExit on the body below.
-        // Without this wrapper any yielded failure inside the while loop (provider
-        // error, network error, thrown defect) would skip the hook entirely.
+        // 通过下面主体上的 Effect.onExit 恰好触发一次 session.post。
+        // 没有这层包裹，while 循环内任何被 yield 出来的失败（provider 错误、
+        // 网络错误、抛出的 defect）都会完全跳过这个钩子。
         //
-        // Trajectory parity: uses MessageV2.filterCompactedEffect with the session's
-        // contextFrom / contextWatermark so compaction boundaries trim history to
-        // what the agent actually saw, and child-session parent prefixes are
-        // included — matching session.userQuery.post semantics.
+        // 轨迹一致性：使用 MessageV2.filterCompactedEffect 配合会话的 contextFrom /
+        // contextWatermark，使 compaction 边界把历史裁剪到 agent 实际看到的范围，
+        // 并且包含子会话的父级前缀——与 session.userQuery.post 语义一致。
         const firePostSession = (exit: Exit.Exit<MessageV2.WithParts, unknown>) =>
           Effect.gen(function* () {
             const sliceMsgs = yield* MessageV2.filterCompactedEffect(sessionID, {
@@ -2163,21 +2139,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               validation_status: "skipped",
             })
             .pipe(Effect.ignore)
-        // Trim freed space but `lastFinished.tokens` still reflects pre-trim state.
-        // Skip one overflow check so the model can respond on the trimmed context;
-        // its new assistant message will carry accurate tokens for the next check.
+        // 裁剪释放了空间，但 `lastFinished.tokens` 仍反映裁剪前的状态。
+        // 跳过一次溢出检查，让模型能在裁剪后的上下文上作答；
+        // 它新的助手消息会为下一次检查携带准确的 token 数。
         let skipOverflowCheck = false
 
         const textLoopBuffer: string[] = []
         let textLoopRecoveryAttempts = 0
         let textNgramRecoveryAttempts = 0
 
-        // Contract (T05): on finish="length", inject a continuation nudge ONLY for
-        // plain text. If any non-providerExecuted client tool part exists we bail
-        // (return false) and let classify route the normal tool-observation re-loop.
-        // This guarantees "no output-length continuation when a tool is involved" —
-        // it does NOT guarantee a stream-time-truncated tool never executed, since
-        // the AI SDK runs tools mid-stream before the finish reason is known.
+        // 契约（T05）：当 finish="length" 时，仅对纯文本注入续写提示。如果存在任何
+        // 非 providerExecuted 的客户端工具 part，就放弃（返回 false），交由 classify
+        // 走正常的"工具观测再循环"。这保证了"涉及工具时不做 output-length 续写"——
+        // 但它*不*保证一个在流式过程中被截断的工具从未执行过，因为 AI SDK 会在得知
+        // finish 原因之前就在流中途运行工具。
         const autoContinueOutputLength = Effect.fn("SessionPrompt.autoContinueOutputLength")(function* (input: {
           lastUser: MessageV2.User
           assistant: MessageV2.Assistant
@@ -2228,38 +2203,33 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
-        // Task stop-condition gate (main agent only). Before honoring a stop,
-        // list non-terminal tasks in the session: if any remain, inject a
-        // nudge as a synthetic user turn and re-enter (return true) so the
-        // model closes them with `task done` / `task abandon`. ReAct cap +
-        // counter mirror the goal gate; cap-exceeded allows stop with a
-        // warn log (no reportedStatus on main). owner=undefined picks up
-        // tasks orphaned by subagent gates that hit their own cap. Runs
-        // BEFORE goalGate because task state is cheaper to settle and a
-        // pending-task board pollutes any goal verdict.
+        // 任务停止条件闸门（仅主 agent）。在允许停止之前，列出会话里未终结的任务：
+        // 如果还有剩余，就以合成用户 turn 的形式注入一条提示并重入（返回 true），
+        // 让模型用 `task done` / `task abandon` 把它们收尾。ReAct 上限 + 计数器
+        // 与 goal 闸门相同；超过上限则允许停止并记一条 warn 日志（主 agent 上无
+        // reportedStatus）。owner=undefined 会接手那些被达到自身上限的子 agent 闸门
+        // 遗弃的任务。在 goalGate *之前*运行，因为任务状态更容易结算，而一块待办任务
+        // 板会污染任何 goal 裁决。
         const taskGate = Effect.fn("SessionPrompt.taskGate")(function* (lastUser: MessageV2.User) {
           if ((agentID ?? "main") !== "main") return false
-          // If the main agent has the `task` tool stripped (Permission.disabled),
-          // a nudge to call `task done` is unsatisfiable and would re-loop to
-          // cap. Skip the gate entirely. Mirrors the canWrite skip in
-          // actor/spawn.ts (Permission.disabled(["write"], ...) check on
-          // forkAgentInfo). Per-session resolution means this checks the
-          // agent's static permission only (good enough for v1; session-
-          // level overrides re-enabling task on a denied agent are
-          // pathological and out of scope).
+          // 如果主 agent 的 `task` 工具被剥离了（Permission.disabled），那么提示它去
+          // 调用 `task done` 是无法满足的，并且会一直重入直到达到上限。此时完全跳过
+          // 闸门。这与 actor/spawn.ts 里的 canWrite 跳过（对 forkAgentInfo 做
+          // Permission.disabled(["write"], ...) 检查）相对应。按会话解析意味着这里
+          // 只检查 agent 的静态权限（对 v1 足够；会话级覆盖在被拒绝的 agent 上重新
+          // 启用 task 属于病态情况，超出范围）。
           const mainAgent = yield* agents.get("main").pipe(Effect.orElseSucceed(() => undefined))
           if (mainAgent && Permission.disabled(["task"], mainAgent.permission).has("task")) return false
-          // Per-message `tools` is the second tool-strip layer (llm.ts:720
-          // `input.user.tools?.[k] !== false` filter), separate from
-          // Permission.disabled. A slash command pinning a narrow toolset for
-          // its turn can drop `task` even when permission allows it; nudging
-          // is then unsatisfiable. Same skip rationale, narrower window.
+          // 按消息的 `tools` 是第二层工具剥离（llm.ts:720 的
+          // `input.user.tools?.[k] !== false` 过滤），独立于 Permission.disabled。
+          // 一个为其 turn 固定了狭窄工具集的斜杠命令，可能在权限允许的情况下仍丢掉
+          // `task`；此时提示就无法满足。跳过理由相同，只是作用窗口更窄。
           if (lastUser.tools?.["task"] === false) return false
 
           const count = yield* taskGateState.get(sessionID)
-          // runLoop is annotated `R = never`; TaskGate.decide raises a
-          // TaskRegistry.Service requirement that we close locally with the
-          // layer-resolved binding so it doesn't leak into runLoop's R-set.
+          // runLoop 被标注为 `R = never`；TaskGate.decide 会引入一个
+          // TaskRegistry.Service 依赖需求，我们在本地用已由 layer 解析的绑定把它闭合，
+          // 使其不会泄漏进 runLoop 的 R 集合。
           const decision = yield* TaskGate.decide({
             session_id: sessionID,
             owner: undefined,
@@ -2300,13 +2270,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
-        // Goal stop-condition gate (main agent only). Before honoring a stop,
-        // an independent judge model reads the transcript and decides whether
-        // the active goal is satisfied. Not satisfied → inject the judge's
-        // reason as a synthetic user turn and signal the caller to keep working
-        // (return true). This is the main-loop analogue of actor.preStop ReAct
-        // re-entry, which only fires for spawned actors. fail-open on any judge
-        // error so a flaky judge can never trap the user.
+        // Goal 停止条件闸门（仅主 agent）。在允许停止之前，一个独立的裁判模型读取
+        // 对话记录并判断当前活跃的 goal 是否已满足。未满足 → 把裁判给出的理由作为
+        // 合成用户 turn 注入，并向调用方发出继续工作的信号（返回 true）。这是
+        // actor.preStop ReAct 重入的主循环对应物，后者只对派生 actor 触发。对任何
+        // 裁判错误采取 fail-open，这样一个不稳定的裁判永远不会困住用户。
         const goalGate = Effect.fn("SessionPrompt.goalGate")(function* (lastUser: MessageV2.User) {
           if ((agentID ?? "main") !== "main") return false
           const active = yield* goal.get(sessionID)
@@ -2317,8 +2285,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             contextWatermark: session.contextWatermark,
             agentID: "main",
           })
-          // Anchor the verdict to the assistant turn the judge just evaluated, so
-          // the TUI can render a per-turn marker the user can trace back to.
+          // 把裁决锚定到裁判刚刚评估过的那个助手 turn，这样 TUI 就能渲染一个
+          // 按 turn 的标记，供用户回溯定位。
           const judgedMessageID = transcriptMsgs.findLast((m) => m.info.role === "assistant")?.info.id
           const verdict = yield* goal
             .evaluate({
@@ -2342,9 +2310,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               sessionID,
               impossible: verdict.impossible === true,
             })
-            // Publish the final verdict (goal cleared) so the TUI can render the
-            // ✓/⊘ result line before the indicator disappears. goal.clear also
-            // publishes goal:undefined, but the TUI keeps lastVerdict sticky.
+            // 发布最终裁决（goal 已清除），使 TUI 能在指示器消失前渲染
+            // ✓/⊘ 结果行。goal.clear 也会发布 goal:undefined，但 TUI 会让
+            // lastVerdict 保持粘滞。
             yield* bus.publish(Goal.Event.Updated, {
               sessionID,
               goal: undefined,
@@ -2410,11 +2378,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
-        // think-only (reasoning only) / empty (nothing at all) steps finish with
-        // a non-tool stop but carry no usable answer. Without intervention the loop
-        // breaks and hands the user an assistant with no final text. Nudge the model
-        // to produce a final answer or call a real tool; give up (write a terminal
-        // error) once the shared counter is exhausted so we never loop forever.
+        // 仅推理（think-only）/ 空（empty，什么都没有）的步骤以非工具方式停止，
+        // 却没有携带任何可用答案。若不干预，循环就会中断，把一个没有最终文本的助手
+        // 消息交给用户。提示模型给出最终答案或调用一个真正的工具；一旦共享计数器
+        // 耗尽就放弃（写入一个终止性错误），这样我们永远不会无限循环。
         const autoContinueInvalidOutput = Effect.fn("SessionPrompt.autoContinueInvalidOutput")(function* (input: {
           lastUser: MessageV2.User
           assistant: MessageV2.Assistant
@@ -2461,24 +2428,21 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
-        // Text-form tool call recovery. The model serialized a tool call as prose
-        // text instead of a structured tool_use (a degraded state under large
-        // context). The bad assistant turn is DISCARDED from history by setting
-        // assistant.error (toModelMessages skips a message whose info.error is
-        // set, message-v2.ts), so it can neither strand the conversation on an
-        // assistant turn (provider prefill rejection) nor poison later context.
-        // We then retry the request (caller does `continue`, no new message). On
-        // exhaustion the error stays terminal. Returns true ⇒ continue; false ⇒ break.
+        // 文本形式工具调用的恢复。模型把工具调用序列化成了散文文本而非结构化的
+        // tool_use（大上下文下的一种退化状态）。通过设置 assistant.error 把这个坏的
+        // 助手 turn 从历史中*丢弃*（toModelMessages 会跳过 info.error 被设置的消息，
+        // 见 message-v2.ts），这样它既不会把对话搁浅在一个助手 turn 上（导致 provider
+        // 预填充被拒），也不会污染后续上下文。随后我们重试该请求（调用方执行
+        // `continue`，不创建新消息）。耗尽后错误保持终止性。返回 true ⇒ continue；
+        // false ⇒ break。
         const autoRetryTextToolCall = Effect.fn("SessionPrompt.autoRetryTextToolCall")(function* (input: {
           lastUser: MessageV2.User
           assistant: MessageV2.Assistant
         }) {
-          // Already discarded on a prior pass — let classify fall through to
-          // `failed` instead of re-detecting and burning another retry.
+          // 上一趟已经丢弃过——让 classify 落到 `failed`，而不是再次检测并浪费一次重试。
           if (input.assistant.error) return false
-          // Discard the bad turn from request history: toModelMessages skips a
-          // message whose info.error is set, so it can neither strand the
-          // conversation on an assistant turn nor poison later context.
+          // 把这个坏 turn 从请求历史中丢弃：toModelMessages 会跳过 info.error 被设置的
+          // 消息，这样它既不会把对话搁浅在一个助手 turn 上，也不会污染后续上下文。
           input.assistant.error = new MessageV2.TextToolCallError({
             message: "Model emitted a tool call as text instead of a structured tool call.",
           }).toObject()
@@ -2492,10 +2456,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
           textToolCallRetries++
           yield* slog.info("retrying text-form tool call", { attempt: textToolCallRetries })
-          // Append a synthetic user turn so the discarded assistant becomes stale
-          // (classify staleness guard) AND the loop reaches generation — mirrors
-          // autoRetryStructuredOutput. Without this the loop re-enters, re-detects
-          // the same turn, and burns retries with zero model calls.
+          // 追加一个合成用户 turn，使被丢弃的助手消息变得陈旧（classify 的陈旧性保护），
+          // 并让循环推进到生成阶段——与 autoRetryStructuredOutput 一致。没有这一步，
+          // 循环会重入、再次检测到同一个 turn，并在零次模型调用的情况下耗尽重试。
           const msg = yield* sessions.updateMessage({
             id: MessageID.ascending(),
             role: "user" as const,
@@ -2524,12 +2487,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
-        // json_schema mode but the model never produced structured output (plain
-        // text stop, empty, think-only, or any other non-tool terminal). Retry up
-        // to lastUser.format.retryCount with a repair nudge; on exhaustion write a
-        // StructuredOutputError carrying the *real* retry count. Separate from
-        // invalidContinuations: structured retries are bounded by the per-request
-        // retryCount, not the generic invalid-output limit.
+        // json_schema 模式，但模型从未产出结构化输出（纯文本停止、空、仅推理，或任何
+        // 其他非工具的终止态）。用一条修复提示重试至多 lastUser.format.retryCount 次；
+        // 耗尽后写入一个携带*真实*重试次数的 StructuredOutputError。与
+        // invalidContinuations 分离：结构化重试受每次请求的 retryCount 约束，
+        // 而非通用的 invalid-output 上限。
         const autoRetryStructuredOutput = Effect.fn("SessionPrompt.autoRetryStructuredOutput")(function* (input: {
           lastUser: MessageV2.User
           assistant: MessageV2.Assistant
@@ -2559,7 +2521,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             agent: input.lastUser.agent,
             model: input.lastUser.model,
             tools: input.lastUser.tools,
-            // Must carry format so the next iteration re-registers the StructuredOutput tool.
+            // 必须携带 format，这样下一次迭代才会重新注册 StructuredOutput 工具。
             format: input.lastUser.format,
             time: { created: Date.now() },
           })
@@ -2581,9 +2543,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
-        // Sliding-window n-gram repetition recovery. Symmetric across main and
-        // fork branches: 1st hit injects REMIND, 2nd hit injects REPLAN, 3rd
-        // hit (>= TEXT_NGRAM_MAX_RECOVERY) writes an error and signals break.
+        // 滑动窗口 n-gram 重复恢复。在主分支和 fork 分支间对称：第 1 次命中注入
+        // REMIND，第 2 次命中注入 REPLAN，第 3 次命中（>= TEXT_NGRAM_MAX_RECOVERY）
+        // 写入错误并发出 break 信号。
         const handleTextRepeat = Effect.fn("SessionPrompt.handleTextRepeat")(function* (input: {
           lastUser: MessageV2.User
         }) {
@@ -2623,10 +2585,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
-        // content-filter is terminal on first occurrence: re-sending the same
-        // turn would just get filtered again, so there is no nudge / counter.
-        // Write a user-visible error (rendered via the session.error toast) and
-        // let the caller break.
+        // content-filter 在首次出现时即为终止性：重发同一个 turn 只会再次被过滤，
+        // 所以没有提示 / 计数器。写入一个用户可见的错误（通过 session.error toast
+        // 渲染），并让调用方 break。
         const writeContentFilterError = Effect.fn("SessionPrompt.writeContentFilterError")(function* (input: {
           assistant: MessageV2.Assistant
         }) {
@@ -2641,11 +2602,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           })
         })
 
-        // A `failed` classification (model "error" finish, or an error already set
-        // by the stream-error path) is terminal. If the step already carries an
-        // error (e.g. APIError written when the stream threw, processor.ts:581),
-        // keep it; otherwise write a ModelError so the loop never breaks silently
-        // without a user-visible failure.
+        // `failed` 分类（模型以 "error" 结束，或流错误路径已设置了错误）是终止性的。
+        // 如果该步骤已经携带了错误（例如流抛出时写入的 APIError，processor.ts:581），
+        // 就保留它；否则写入一个 ModelError，使循环永远不会在没有用户可见失败的情况下
+        // 悄无声息地中断。
         const writeModelError = Effect.fn("SessionPrompt.writeModelError")(function* (input: {
           assistant: MessageV2.Assistant
           reason: string
@@ -2660,19 +2620,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         })
 
         while (true) {
-          // F55: only main agent sets session status to busy; subagent runners
-          // must not touch session-level status (Runner.onBusy is Effect.void
-          // for non-main actors per F47).
+          // F55：只有主 agent 才把会话状态设为 busy；子 agent 的 runner
+          // 不得触碰会话级状态（按 F47，非主 actor 的 Runner.onBusy 是 Effect.void）。
           if (!agentID || agentID === "main") yield* status.set(sessionID, { type: "busy" })
           yield* inbox.drain(sessionID, agentID ?? "main").pipe(Effect.ignore)
           yield* slog.info("loop", { step })
 
-          // F37: filter by agentID so subagent slices stay isolated from the
-          // main agent's slice within the same session. Without this, an actor
-          // (explore/general/etc) spawned via mimocode's shared-sessionID
-          // design would see the parent's full conversation here and drift
-          // off-task. agentID === "main" => main agent slice (agent_id = 'main'
-          // in DB), agentID === "explore-1" => only explore-1's slice.
+          // F37：按 agentID 过滤，使子 agent 的切片在同一会话内与主 agent 的切片保持
+          // 隔离。没有这一步，通过 mimocode 的共享 sessionID 设计派生出来的 actor
+          //（explore/general 等）会在这里看到父级的完整对话，从而偏离任务。
+          // agentID === "main" => 主 agent 切片（DB 中 agent_id = 'main'），
+          // agentID === "explore-1" => 只有 explore-1 的切片。
           let msgs = yield* MessageV2.filterCompactedEffect(sessionID, {
             contextFrom: session.contextFrom,
             contextWatermark: session.contextWatermark,
@@ -2695,12 +2653,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
 
-          // Per-user-message active recall reminder. Once the session has
-          // any memory artifacts (memory dir populated OR tasks recorded),
-          // append a brief recall protocol so the agent's reflex to query
-          // memory.search / task / actor / Read stays warm across many
-          // post-rebuild turns. Cost ~120 tokens per turn, conditional on
-          // hasMemoryOrTasks.
+          // 按用户消息的主动召回提醒。一旦会话有了任何 memory 产物（memory 目录已填充
+          // 或已记录 task），就追加一段简短的召回协议，使 agent 查询
+          // memory.search / task / actor / Read 的反射在许多 rebuild 之后的 turn 里
+          // 仍保持活跃。每个 turn 约 120 token，以 hasMemoryOrTasks 为条件。
           const lastUserMsgForRecall = msgs.findLast((m) => m.info.role === "user")
           if (lastUserMsgForRecall) {
             const hasRecallTarget = yield* checkpoint
@@ -2734,10 +2690,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
           )
-          // Some providers return "stop" even when the assistant message contains tool calls.
-          // Keep the loop running so tool results can be sent back to the model.
-          // Skip provider-executed tool parts — those were fully handled within the
-          // provider's stream (e.g. DWS Agent Platform) and don't need a re-loop.
+          // 有些 provider 即便助手消息里包含工具调用也会返回 "stop"。
+          // 保持循环运行，以便把工具结果送回模型。
+          // 跳过 provider 执行的工具 part——那些已在 provider 的流内部完全处理完毕
+          //（例如 DWS Agent Platform），不需要再循环一次。
           const hasToolCalls =
             lastAssistantMsg?.parts.some((part) => part.type === "tool" && !part.metadata?.providerExecuted) ?? false
 
@@ -2802,10 +2758,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             const dreamTrigger = yield* shouldAutoDream(cfg).pipe(Effect.catch(() => Effect.succeed(false)))
             const distillTrigger = yield* shouldAutoDistill(cfg).pipe(Effect.catch(() => Effect.succeed(false)))
             const mdl = { providerID: lastUser.model.providerID, modelID: lastUser.model.modelID }
-            // AppRuntime is imported dynamically (not at module top level) to keep
-            // the session layer out of the app-runtime module-init cycle
-            // (prompt → app-runtime → AppLayer → SessionPrompt). Only loaded when a
-            // trigger actually fires. Detached fire-and-forget on the full runtime.
+            // AppRuntime 是动态导入的（不在模块顶层），以使 session 层不卷入 app-runtime
+            // 的模块初始化循环（prompt → app-runtime → AppLayer → SessionPrompt）。
+            // 仅在某个触发器真正触发时才加载。在完整 runtime 上以分离的 fire-and-forget 方式运行。
             const needAppRuntime = dreamTrigger || distillTrigger || Flag.MIMOCODE_EXPERIMENTAL_CRON
             if (needAppRuntime) {
               const { AppRuntime } = yield* Effect.promise(() => import("@/effect/app-runtime"))
@@ -2831,13 +2786,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   ),
                 ).catch((err) => log.error("auto-distill prompt failed", { error: String(err) }))
               }
-              // T18-bridge mount: fire CronBridge.start(sessionID, workspaceRoot)
-              // once per new top-level session boot. The bridge itself no-ops when
-              // MIMOCODE_EXPERIMENTAL_CRON is unset; the outer gate just skips the
-              // resolve cost in the common case. Mirrors auto-dream's detached
-              // dynamic-import pattern so prompt.ts stays out of the app-runtime
-              // module-init cycle. Bridge.start is idempotent via its `started`
-              // guard, and its Layer finalizer handles teardown on scope close.
+              // T18-bridge 挂载：每个新的顶层会话启动时触发一次
+              // CronBridge.start(sessionID, workspaceRoot)。当 MIMOCODE_EXPERIMENTAL_CRON
+              // 未设置时 bridge 本身会 no-op；外层的门控只是在常见情况下省去解析成本。
+              // 与 auto-dream 的分离式动态导入模式一致，使 prompt.ts 不卷入 app-runtime
+              // 的模块初始化循环。Bridge.start 通过其 `started` 保护是幂等的，其 Layer
+              // finalizer 会在 scope 关闭时处理拆卸。
               if (Flag.MIMOCODE_EXPERIMENTAL_CRON) {
                 const workspaceRoot = (yield* InstanceState.context).worktree
                 const { CronBridge } = yield* Effect.promise(() => import("@/session/cron-bridge"))
@@ -2858,8 +2812,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             continue
           }
 
-          // Detect compaction boundary: if the last user message has a compaction
-          // part, route to compact.process() instead of the normal LLM flow.
+          // 检测 compaction 边界：如果最后一条用户消息带有 compaction part，
+          // 就路由到 compact.process()，而不是走正常的 LLM 流程。
           const lastUserMsgForCompaction = msgs.findLast((m) => m.info.role === "user")
           if (lastUserMsgForCompaction?.parts.some((p) => p.type === "compaction")) {
             const compactionPart = lastUserMsgForCompaction.parts.find(
@@ -2874,39 +2828,33 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               overflow: compactionPart?.overflow,
               agentID: lastUser.agentID,
             })
-            // cron-sentinel cache is invalidated via a SessionCompaction.Event
-            // .Compacted bus subscription inside cron-bridge — see
-            // `compaction.ts:468` publish + `cron-bridge.ts` subscribe pair.
-            // Covers this user-`/compact` path plus the overflow-boundary
-            // path in compaction.create.
+            // cron-sentinel 缓存通过 cron-bridge 内对 SessionCompaction.Event.Compacted
+            // 的总线订阅来失效——见 `compaction.ts:468` 的 publish 与 `cron-bridge.ts`
+            // 的 subscribe 这一对。既覆盖这里的用户 `/compact` 路径，也覆盖
+            // compaction.create 里的溢出边界路径。
             if (result === "stop") break
             continue
           }
 
-          // Memory flush nudge at high context pressure.
+          // 高上下文压力下的内存刷写提示。
           //
-          // Purpose: at high context fill, the session may soon checkpoint and
-          // discard old context, so remind the model to externalize durable
-          // learnings to memory BEFORE that happens. This is a *save-your-work*
-          // reminder, NOT a signal to wrap up.
+          // 目的：在上下文填充较高时，会话可能很快就会做 checkpoint 并丢弃旧上下文，
+          // 因此在那之前提醒模型把持久的学习成果外化到 memory。这是一条*保存你的工作*
+          // 的提醒，*不是*收尾的信号。
           //
-          // Two failure modes this guards against (both observed in prod):
-          //   1. Wording that reads as "we're about to reset — wind down" made
-          //      models prematurely end their turn and hand control back to the
-          //      user mid-task. The text below is explicit: persist memory, then
-          //      KEEP GOING; do not end the turn.
-          //   2. Re-injecting the nudge on every user turn while pressure stays
-          //      high turned a one-time heads-up into per-turn nagging. We now
-          //      dedup across the recent conversation window, not just the
-          //      current user message.
+          // 它防范两种失败模式（都在生产环境中观察到过）：
+          //   1. 读起来像"我们即将重置——收尾吧"的措辞，会让模型在任务中途过早结束
+          //      其 turn 并把控制权交回给用户。下面的文本很明确：先持久化 memory，
+          //      然后*继续*；不要结束 turn。
+          //   2. 在压力持续偏高时于每一轮用户 turn 都重新注入提示，会把一次性的提醒
+          //      变成逐 turn 的唠叨。我们现在在最近的对话窗口内去重，而不仅是当前
+          //      这条用户消息。
           if (lastFinished && lastFinished.summary !== true && model) {
             const cfg = yield* config.get()
             const pressure = pressureLevel({ cfg, tokens: lastFinished.tokens, model })
             if (pressure >= 2) {
-              // De-bounce: nudge at most once per high-pressure episode (the
-              // window since the last checkpoint boundary). See
-              // nudgedSinceBoundary for why the boundary — not a fixed message
-              // count — is the right anchor.
+              // 防抖：每个高压力片段（自上一个 checkpoint 边界以来的窗口）至多提示一次。
+              // 关于为何以边界——而非固定消息数——作为正确的锚点，见 nudgedSinceBoundary。
               const NUDGE_MARKER = "Context is filling up"
               const boundaryID = yield* checkpoint
                 .lastBoundary(sessionID)
@@ -2936,11 +2884,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
           }
 
-          // Repeated-step nudge: if the last REPEATED_STEP_THRESHOLD finished
-          // assistant steps made an identical tool call, the model is likely
-          // stuck looping. Inject a reminder on the last user message asking it
-          // to change approach. Mirrors the memory-flush nudge above (synthetic
-          // text part, deduped per build).
+          // 重复步骤提示：如果最近 REPEATED_STEP_THRESHOLD 个已完成的助手步骤发起了
+          // 相同的工具调用，模型很可能陷入了循环。在最后一条用户消息上注入一条提醒，
+          // 要求它改变思路。与上面的内存刷写提示相同（合成文本 part，按 build 去重）。
           if (lastFinished) {
             const recentSignatures: string[] = []
             for (let i = msgs.length - 1; i >= 0 && recentSignatures.length < REPEATED_STEP_THRESHOLD; i--) {
@@ -2981,20 +2927,18 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
           }
 
-          // Resolve the agent for this iteration once. Both the management
-          // hooks below (fireCheckpoints, overflow handler) and the existing
-          // agent-not-found check later in the iteration reuse this binding.
-          // Bounded computation agents (native + hidden — currently title,
-          // summary, checkpoint-writer) are exempt from context management;
-          // see docs/superpowers/specs/2026-04-28-bounded-computation-agents-design.md
+          // 为本次迭代解析一次 agent。下面的管理钩子（fireCheckpoints、溢出处理器）
+          // 以及本次迭代后面已有的"agent 未找到"检查都复用这个绑定。
+          // 有界计算 agent（native + hidden——目前是 title、summary、checkpoint-writer）
+          // 免于上下文管理；见
+          // docs/superpowers/specs/2026-04-28-bounded-computation-agents-design.md
           const agent = yield* agents.get(lastUser.agent)
           const isBoundedComputation =
             agent?.native === true && agent?.hidden === true
 
-          // Fire background checkpoint writers for any newly-crossed thresholds
-          // based on the latest completed assistant message's tokens. Must run
-          // BEFORE the overflow/maxThreshold check below so maxCrossed flag is
-          // set in time to trigger rebuild on this same iteration.
+          // 基于最新已完成助手消息的 token 数，为任何新跨过的阈值触发后台 checkpoint
+          // writer。必须在下面的溢出/maxThreshold 检查*之前*运行，这样 maxCrossed 标志
+          // 才能及时置位，从而在同一次迭代里触发 rebuild。
           if (!skipOverflowCheck && !isBoundedComputation && lastFinished && lastFinished.tokens) {
             const fireOps = yield* ops()
             yield* prune
@@ -3016,13 +2960,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             (overflowCheck({ cfg: yield* config.get(), tokens: lastFinished.tokens, model }) ||
               (yield* prune.maxThresholdCrossed(sessionID)))
           ) {
-            // Subagent overflow → per-actor compaction (lossy LLM summarization
-            // scoped to the actor's (sessionID, agent_id) slice). Subagents
-            // don't have checkpoints, so checkpoint+discard does not apply.
-            // Gate must exclude agentID="main" — F49+F50 made main carry
-            // agentID="main", so a bare `if (lastUser.agentID)` would route
-            // main to this subagent path and skip the checkpoint rebuild
-            // below. See checkpoint.ts:715 for the matching gate.
+            // 子 agent 溢出 → 按 actor 的 compaction（有损的 LLM 摘要，作用于该 actor 的
+            //（sessionID, agent_id）切片）。子 agent 没有 checkpoint，所以 checkpoint+丢弃
+            // 不适用。门控必须排除 agentID="main"——F49+F50 让 main 也携带
+            // agentID="main"，所以裸的 `if (lastUser.agentID)` 会把 main 路由到这条
+            // 子 agent 路径，从而跳过下面的 checkpoint rebuild。相应门控见 checkpoint.ts:715。
             if (lastUser.agentID && lastUser.agentID !== "main") {
               yield* compaction
                 .create({
@@ -3033,21 +2975,18 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   agentID: lastUser.agentID,
                 })
                 .pipe(Effect.ignore)
-              // After inserting the boundary, the actor's filterCompactedEffect
-              // slice begins at the boundary marker — context is freed for the
-              // next iteration's stream. Skip the next overflow check so the
-              // model can respond on the trimmed context.
+              // 插入边界后，该 actor 的 filterCompactedEffect 切片就从边界标记开始——
+              // 上下文为下一次迭代的流被释放出来。跳过下一次溢出检查，让模型能在裁剪后的
+              // 上下文上作答。
               skipOverflowCheck = true
               continue
             }
 
-            // Main-agent overflow: insert a checkpoint boundary marker (never
-            // deletes DB messages) so the next iteration rebuilds from the
-            // freshest checkpoint. Fall back to compaction only when no boundary
-            // can be produced.
+            // 主 agent 溢出：插入一个 checkpoint 边界标记（绝不删除 DB 消息），使下一次
+            // 迭代从最新的 checkpoint 重建。只有在无法产生边界时才回退到 compaction。
             const hasCP = yield* checkpoint.hasCheckpoint(sessionID).pipe(Effect.catch(() => Effect.succeed(false)))
             if (hasCP) {
-              // Wait for any running writer so the freshest checkpoint is available
+              // 等待任何正在运行的 writer，以便拿到最新的 checkpoint
               yield* checkpoint.waitForWriter(sessionID).pipe(Effect.ignore)
 
               const boundary = yield* checkpoint
@@ -3075,8 +3014,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               }
             }
 
-            // F39: no checkpoint — fall back to compaction (LLM-driven lossy summary).
-            // Better than mechanical trim: preserves semantic content via summary.
+            // F39：没有 checkpoint——回退到 compaction（LLM 驱动的有损摘要）。
+            // 优于机械裁剪：通过摘要保留了语义内容。
             yield* compaction
               .create({
                 sessionID,
@@ -3091,8 +3030,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
           skipOverflowCheck = false
 
-          // `agent` resolved at iteration start; reuse here for the
-          // agent-not-found user-visible error.
+          // `agent` 已在迭代开始时解析；这里复用它来产生"agent 未找到"的用户可见错误。
           if (!agent) {
             const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
             const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
@@ -3178,27 +3116,26 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
             const format = lastUser.format ?? { type: "text" as const }
 
-            // Determine if this iteration is for a fork agent (contextMode === "full").
-            // Fork agents use the frozen ForkContext snapshot captured at spawn time
-            // (system + inheritedMessages) rather than recomputing from their own
-            // agent identity — which would diverge from the parent and break the
-            // prefix cache.
+            // 判断本次迭代是否针对一个 fork agent（contextMode === "full"）。
+            // fork agent 使用在派生时捕获的冻结 ForkContext 快照（system +
+            // inheritedMessages），而不是从自身的 agent 身份重新计算——那会与父级
+            // 产生偏差并破坏前缀缓存。
             const actorRecord = lastUser.agentID
               ? yield* actorRegistry.get(sessionID, lastUser.agentID).pipe(
                   Effect.orElseSucceed(() => undefined),
                 )
               : undefined
-            // v9 registers main as `mode: "main"` with `contextMode: "full"`.
-            // Only spawned actors (subagent/peer) carry a frozen ForkContext;
-            // main is the captor, never the captured.
+            // v9 把 main 注册为 `mode: "main"` 且 `contextMode: "full"`。
+            // 只有派生出来的 actor（subagent/peer）才携带冻结的 ForkContext；
+            // main 是捕获者，永远不是被捕获者。
             const isForkAgent =
               actorRecord?.contextMode === "full" &&
               (actorRecord.mode === "subagent" || actorRecord.mode === "peer")
 
-            // Fork path: read frozen ForkContext from Actor service (late-bound via
-            // spawnRef to break the Actor → SessionPrompt → Actor layer cycle).
-            // If forkCtx is missing (race / cleanup bug / spawn skipped), fail the
-            // actor so the next prune turn can spawn a fresh fork.
+            // fork 路径：从 Actor 服务读取冻结的 ForkContext（通过 spawnRef 晚绑定，
+            // 以打破 Actor → SessionPrompt → Actor 的层循环）。如果 forkCtx 缺失
+            //（竞态 / 清理 bug / 派生被跳过），就让该 actor 失败，这样下一次 prune turn
+            // 可以派生一个新的 fork。
             if (isForkAgent) {
               const forkCtxEffect = spawnRef.current?.getForkContext(lastUser.agentID!)
               const forkCtx = forkCtxEffect ? yield* forkCtxEffect : undefined
@@ -3218,14 +3155,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               const ownNewModelMsgs = yield* MessageV2.toModelMessagesEffect(ownNew, model)
               const prebuiltSystem = forkCtx.system
               const modelMsgs: ModelMessage[] = [...forkCtx.inheritedMessages, ...ownNewModelMsgs]
-              // additions is empty for fork agents: system is taken verbatim from
-              // forkCtx.system. Passed as `system` to handle.process for logging/replay.
+              // 对 fork agent 来说 additions 为空：system 逐字取自 forkCtx.system。
+              // 作为 `system` 传给 handle.process 用于日志/回放。
               const additions: string[] = []
-              // Note: fork uses `tools` from resolveTools (not `forkCtx.tools`) — runtime
-              // tool dispatch needs execute closures, which `forkCtx.tools` does not carry.
-              // Schema parity with parent is currently a consequence of checkpoint-writer
-              // having no toolAllowlist (Task 2.6 + agent.test.ts guard). See ForkContext.tools
-              // JSDoc in packages/opencode/src/actor/spawn.ts for the full contract.
+              // 注意：fork 使用来自 resolveTools 的 `tools`（而非 `forkCtx.tools`）——运行时
+              // 的工具分发需要 execute 闭包，而 `forkCtx.tools` 并不携带它。目前与父级的
+              // schema 一致是 checkpoint-writer 没有 toolAllowlist 的结果（Task 2.6 +
+              // agent.test.ts 守卫）。完整契约见 packages/opencode/src/actor/spawn.ts 中
+              // ForkContext.tools 的 JSDoc。
               const queryParts =
                 msgs.findLast((m) => m.info.role === "user" && m.info.id === lastUser.id)?.parts ?? []
               const query = userQueryText(queryParts)
@@ -3267,20 +3204,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 .process({
                   user: lastUser,
                   agent,
-                  // Fork inherits the parent agent's permission (captured at spawn into
-                  // ForkContext). This drives llm.ts resolveTools/disabled() to the SAME
-                  // visible tool set as the parent → prompt-cache parity on the inherited
-                  // prefix. Scope: this affects tool VISIBILITY only; the per-call ask
-                  // ruleset (built separately in resolveTools' ask closure) is unchanged.
-                  // Parity is exact modulo non-default `session.permission`: the parent's
-                  // visibility ruleset is merge(parent.permission, session.permission)
-                  // while the fork's is merge(writer.permission, parentPermission) — so a
-                  // session-level rule pins the parent but not the fork. Still a strict
-                  // improvement over the old bespoke "*":"deny" block (which always
-                  // diverged). The `?? session.permission` is defense-in-depth only:
-                  // parentPermission is a required field (empty `[]` on a missed capture,
-                  // which `??` does NOT override), so the fallback fires solely if a future
-                  // refactor makes the field optional.
+                  // fork 继承父 agent 的权限（在派生时捕获进 ForkContext）。这驱动
+                  // llm.ts 的 resolveTools/disabled() 得到与父级*相同*的可见工具集
+                  // → 在继承的前缀上保持 prompt 缓存一致。作用范围：这只影响工具的*可见性*；
+                  // 每次调用的 ask ruleset（在 resolveTools 的 ask 闭包里单独构建）不变。
+                  // 除非存在非默认的 `session.permission`，否则一致性是精确的：父级的可见性
+                  // ruleset 是 merge(parent.permission, session.permission)，而 fork 的是
+                  // merge(writer.permission, parentPermission)——所以会话级规则会固定父级，
+                  // 但不会固定 fork。这仍然严格优于旧的定制 "*":"deny" 块（后者总是有偏差）。
+                  // `?? session.permission` 仅作为纵深防御：parentPermission 是必填字段
+                  //（捕获失败时为空 `[]`，而 `??` *不会*覆盖它），所以这个回退只有在未来的
+                  // 重构把该字段改为可选时才会触发。
                   permission: forkCtx.parentPermission ?? session.permission,
                   sessionID,
                   parentSessionID: session.parentID,
@@ -3375,8 +3309,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               if (forkClassification.type === "final" && forkClassification.degraded)
                 yield* slog.warn("degraded final on abnormal finish", { finish: handle.message.finish })
               if (result === "stop") return "break" as const
-              // Fork agents are always subagents (lastUser.agentID is set); use
-              // per-actor compaction on overflow (same as non-fork subagent path).
+              // fork agent 始终是子 agent（lastUser.agentID 已设置）；溢出时使用
+              // 按 actor 的 compaction（与非 fork 的子 agent 路径相同）。
               if (!isBoundedComputation && result === "overflow") {
                 yield* compaction
                   .create({
@@ -3397,8 +3331,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               sys.environment(model, session.time.created),
               instruction.system().pipe(Effect.orDie),
             ])
-            // Surface which instruction files (CLAUDE.md, AGENTS.md, ...) were loaded.
-            // Only for primary sessions (subagents would be noisy) and once per session.
+            // 展示加载了哪些指令文件（CLAUDE.md、AGENTS.md 等）。
+            // 仅对主会话（子 agent 会很吵）且每个会话仅一次。
             if (!session.parentID && !instructionsNotified.has(sessionID)) {
               instructionsNotified.add(sessionID)
               const worktree = (yield* InstanceState.context).worktree
@@ -3413,17 +3347,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               ...instructions.content,
               ...(format.type === "json_schema" ? [STRUCTURED_OUTPUT_SYSTEM_PROMPT] : []),
             ]
-            // Note: `buildLLMRequestPrefix` also returns a `tools` field, but we
-            // intentionally don't use it here — the `tools` variable from `resolveTools`
-            // (set earlier via `handle.process({tools: ...})`) carries `execute` closures
-            // the AI SDK needs for runtime tool dispatch, while `buildLLMRequestPrefix`
-            // produces schema-only tools. Schema bytes match between both paths (both call
-            // registry.tools with identical args), so prefix cache parity holds.
-            // Main runLoop: no watermark — LLM must see the full msgs list,
-            // including this turn's intermediate assistant turns (tool reads,
-            // task creates, etc.) so each step doesn't replay from the bare
-            // user prompt. The watermark is for fork capture only (frozen
-            // snapshot of parent-view at spawn time).
+            // 注意：`buildLLMRequestPrefix` 也会返回一个 `tools` 字段，但我们这里有意不用它
+            // ——来自 `resolveTools` 的 `tools` 变量（前面通过 `handle.process({tools: ...})`
+            // 设置）携带了 AI SDK 运行时工具分发所需的 `execute` 闭包，而 `buildLLMRequestPrefix`
+            // 产出的是仅含 schema 的工具。两条路径的 schema 字节一致（都以相同参数调用
+            // registry.tools），所以前缀缓存的一致性成立。
+            // 主 runLoop：无 watermark——LLM 必须看到完整的 msgs 列表，包括本 turn 中间的
+            // 助手 turn（工具读取、task 创建等），这样每一步都不会从裸的用户 prompt 重放。
+            // watermark 仅用于 fork 捕获（派生时对父级视图的冻结快照）。
             const { system: prebuiltSystem, inheritedMessages: modelMsgs } =
               yield* buildLLMRequestPrefix({
                 sessionID,
@@ -3445,8 +3376,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               permission: session.permission,
               sessionID,
               parentSessionID: session.parentID,
-              // system: additions is preserved for non-LLM consumers of StreamInput (e.g.,
-              // MessageV2.User.system for logging/replay); llm.stream itself uses prebuiltSystem.
+              // system: additions 为 StreamInput 的非 LLM 消费者保留（例如
+              // MessageV2.User.system，用于日志/回放）；llm.stream 本身使用 prebuiltSystem。
               system: additions,
               prebuiltSystem,
               messages: [...modelMsgs, ...(isLastStep ? [{ role: "user" as const, content: MAX_STEPS }] : [])],
@@ -3496,8 +3427,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
             const stepEffect = useMaxMode
               ? MaxMode.runMaxStep({
-                  // runMaxStep reuses the identical per-step args as handle.process,
-                  // plus the orchestration handles it needs.
+                  // runMaxStep 复用与 handle.process 完全相同的每步参数，
+                  // 外加它所需的编排句柄。
                   ...processArgs,
                   handle,
                   llm,
@@ -3589,12 +3520,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               yield* slog.warn("degraded final on abnormal finish", { finish: handle.message.finish })
             if (result === "stop") return "break" as const
             if (!isBoundedComputation && result === "overflow") {
-              // Subagent overflow → per-actor compaction. Insert a boundary
-              // tagged with the subagent's agent_id; the next runLoop iteration
-              // will see a trimmed context (filterCompactedEffect stops at
-              // the boundary).
-              // Gate must exclude "main" — see comment at the matching gate
-              // earlier in this file (~line 1716) and at checkpoint.ts:715.
+              // 子 agent 溢出 → 按 actor 的 compaction。插入一个用子 agent 的 agent_id
+              // 标记的边界；下一次 runLoop 迭代将看到裁剪后的上下文（filterCompactedEffect
+              // 在边界处停止）。
+              // 门控必须排除 "main"——见本文件前面相应门控处的注释（约 1716 行）
+              // 以及 checkpoint.ts:715。
               if (lastUser.agentID && lastUser.agentID !== "main") {
                 yield* compaction
                   .create({
@@ -3609,10 +3539,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 return "continue" as const
               }
 
-              // Main-agent provider-signalled overflow: insert a checkpoint
-              // boundary marker (never deletes). Prefer rebuild over compaction:
-              // if a writer is running or finished, wait (bounded) and rebuild
-              // from it. Fall back to compaction only when no boundary exists.
+              // 主 agent 由 provider 发出信号的溢出：插入一个 checkpoint 边界标记
+              //（绝不删除）。优先 rebuild 而非 compaction：如果有 writer 正在运行或已完成，
+              // 就（有界地）等待并从它 rebuild。只有在不存在边界时才回退到 compaction。
               const writerRunning = yield* checkpoint.isWriterRunning(sessionID)
                 .pipe(Effect.catch(() => Effect.succeed(false)))
               const hasCP = yield* checkpoint.hasCheckpoint(sessionID)
@@ -3643,7 +3572,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }
               }
 
-              // F39: no checkpoint — fall back to compaction (LLM-driven lossy summary).
+              // F39：没有 checkpoint——回退到 compaction（LLM 驱动的有损摘要）。
               yield* compaction
                 .create({
                   sessionID,
@@ -3658,14 +3587,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             return "continue" as const
           }).pipe(Effect.ensuring(instruction.clear(handle.message.id)))
 
-          // --- Text Loop Detection (cross-step) ---
+          // --- 文本循环检测（跨步骤）---
           const completedParts = MessageV2.parts(handle.message.id)
           const stepText = completedParts
             .filter((p): p is MessageV2.TextPart => p.type === "text" && !p.synthetic)
             .map((p) => p.text)
             .join(" ")
           if (stepText.trim()) {
-            // Include tool call signatures in the key so same text + different tools ≠ loop
+            // 把工具调用签名也纳入 key，这样"相同文本 + 不同工具"不会被判为循环
             const toolSig = completedParts
               .filter((p): p is MessageV2.ToolPart => p.type === "tool")
               .map((p) => `${p.tool}:${JSON.stringify(p.state && "input" in p.state ? p.state.input : "")}`)
@@ -3690,7 +3619,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }
                 const recoveryText =
                   textLoopRecoveryAttempts === 0 ? RECOVERY_PROMPT_MILD : RECOVERY_PROMPT_STRONG
-                // Create a NEW user message at the end of conversation (not append to original)
+                // 在对话末尾创建一条*新的*用户消息（而不是追加到原来的那条）
                 const reentry = yield* sessions.updateMessage({
                   id: MessageID.ascending(),
                   role: "user" as const,
@@ -3784,10 +3713,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
       const agentName = cmd.agent ?? input.agent ?? (yield* agents.defaultAgent())
 
-      // /goal — set or clear a session-level stop-condition goal. The condition
-      // text itself becomes the prompt for this turn (the working agent starts
-      // pursuing it immediately); the main runLoop then refuses to stop until
-      // the judge says it's satisfied. See session/goal.ts.
+      // /goal —— 设置或清除一个会话级的停止条件 goal。条件文本本身成为本 turn 的
+      // prompt（工作 agent 会立即开始追求它）；随后主 runLoop 会拒绝停止，直到裁判
+      // 判定它已满足。见 session/goal.ts。
       if (input.command === Command.Default.GOAL) {
         const condition = input.arguments.trim()
         if (condition === "" || condition === "clear" || condition === "reset") {
@@ -4114,19 +4042,19 @@ export const CommandInput = z.object({
 })
 export type CommandInput = z.infer<typeof CommandInput>
 
-/** @internal Exported for testing */
+/** @internal 导出仅供测试使用 */
 export function createStructuredOutputTool(input: {
   schema: Record<string, any>
   onSuccess: (output: unknown) => void
 }): AITool {
-  // Remove $schema property if present (not needed for tool input)
+  // 如果存在 $schema 属性就移除它（工具输入不需要它）
   const { $schema: _, ...toolSchema } = input.schema
 
   return tool({
     description: STRUCTURED_OUTPUT_DESCRIPTION,
     inputSchema: jsonSchema(toolSchema as JSONSchema7),
     async execute(args) {
-      // AI SDK validates args against inputSchema before calling execute()
+      // AI SDK 在调用 execute() 之前会校验 args 是否符合 inputSchema
       input.onSuccess(args)
       return {
         output: "Structured output captured successfully.",
@@ -4143,30 +4071,28 @@ export function createStructuredOutputTool(input: {
   })
 }
 const bashRegex = /!`([^`]+)`/g
-// Match [Image N] as single token, quoted strings, or non-space sequences
+// 把 [Image N] 匹配为单个 token、带引号的字符串，或非空白字符序列
 const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
 const placeholderRegex = /\$(\d+)/g
 const quoteTrimRegex = /^["']|["']$/g
 
 /**
- * Fire seam for scheduled prompts (T18, spec [S5]).
+ * 定时 prompt 的触发接缝（T18，规范 [S5]）。
  *
- * Funnels a cron/loop fire through the SAME entry point typed user prompts use:
- * `SessionPrompt.Service.prompt`. The synthetic part carries `synthetic: true`
- * (mimocode convention for `isMeta`) so transcript-preview surfaces can hide it,
- * and `metadata.origin = { kind: "cron", taskId, kindOfTask }` so the TUI can
- * render a clock icon. Sentinel expansion is intentionally NOT done here — T19
- * will wrap `value` before this call.
+ * 把一次 cron/loop 触发经由与打字输入的用户 prompt *相同*的入口漏斗式送入：
+ * `SessionPrompt.Service.prompt`。合成 part 带有 `synthetic: true`（mimocode 中
+ * `isMeta` 的约定），使对话预览界面可以隐藏它；并带有
+ * `metadata.origin = { kind: "cron", taskId, kindOfTask }`，使 TUI 能渲染一个时钟图标。
+ * 这里*有意*不做 sentinel 展开——T19 会在本调用之前包裹 `value`。
  */
 export type ScheduledPromptOrigin = {
   kind: "cron"
   taskId: string
   kindOfTask: "cron" | "loop"
   /**
-   * ISO-8601 timestamp of when the scheduler tick fired this task. Set by the
-   * cron bridge in `onFire`; persisted on the synthetic part's metadata so the
-   * TUI and downstream consumers can recover fire time without parsing the
-   * prepended text prefix.
+   * 调度器 tick 触发本任务时的 ISO-8601 时间戳。由 cron bridge 在 `onFire` 中设置；
+   * 持久化在合成 part 的 metadata 上，使 TUI 及下游消费者无需解析前置的文本前缀
+   * 即可恢复触发时间。
    */
   firedAt?: string
 }
