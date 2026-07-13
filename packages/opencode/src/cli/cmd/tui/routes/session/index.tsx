@@ -60,6 +60,8 @@ import { useDialog } from "../../ui/dialog"
 import { DialogMessage } from "./dialog-message"
 import type { PromptInfo } from "../../component/prompt/history"
 import { DialogConfirm } from "@tui/ui/dialog-confirm"
+import { DialogAlert } from "@tui/ui/dialog-alert"
+import { DialogPrompt } from "@tui/ui/dialog-prompt"
 import { DialogTimeline } from "./dialog-timeline"
 import { DialogForkFromTimeline } from "./dialog-fork-from-timeline"
 import { DialogSessionRename } from "../../component/dialog-session-rename"
@@ -124,6 +126,25 @@ function use() {
   return ctx
 }
 
+function SidebarToggleButton(props: { visible: boolean; onToggle: () => void }) {
+  const { theme } = useTheme()
+  const [hover, setHover] = createSignal(false)
+  return (
+    <box
+      width={3}
+      height="100%"
+      justifyContent="flex-start"
+      alignItems="center"
+      backgroundColor={hover() ? theme.backgroundElement : undefined}
+      onMouseOver={() => setHover(true)}
+      onMouseOut={() => setHover(false)}
+      onMouseUp={() => props.onToggle()}
+    >
+      <text fg={hover() ? theme.text : theme.textMuted}>{props.visible ? "▶" : "◀"}</text>
+    </box>
+  )
+}
+
 export function Session() {
   const route = useRouteData("session")
   const fullRoute = useRoute()
@@ -138,12 +159,20 @@ export function Session() {
   const session = createMemo(() => sync.session.get(route.sessionID))
   const currentAgentID = useCurrentAgentID()
   const actors = createMemo(() => sync.data.actor[route.sessionID] ?? [])
-  const messages = createMemo(() => sync.data.message[route.sessionID]?.[currentAgentID()] ?? [])
+  const messages = createMemo(() => {
+    const buckets = sync.data.message[route.sessionID]
+    const agentID = currentAgentID()
+    // A peer child runs its own turns under agentID == its own sessionID
+    // (spawn.ts), so its messages bucket under [sessionID] not ["main"]. When
+    // attaching to such a child at "main", fall back to its own-id bucket so the
+    // full session renders instead of an empty "main" view.
+    if (agentID === "main" && !buckets?.["main"]?.length) return buckets?.[route.sessionID] ?? []
+    return buckets?.[agentID] ?? []
+  })
   const permissions = createMemo(() => sync.data.permission[route.sessionID] ?? [])
   const questions = createMemo(() => sync.data.question[route.sessionID] ?? [])
   const visible = createMemo(
     () =>
-      !session()?.parentID &&
       currentAgentID() === "main" &&
       permissions().length === 0 &&
       questions().length === 0,
@@ -193,7 +222,6 @@ export function Session() {
 
   const wide = createMemo(() => dimensions().width > 120)
   const sidebarVisible = createMemo(() => {
-    if (session()?.parentID) return false
     if (currentAgentID() !== "main") return false
     if (sidebarOpen()) return true
     if (sidebar() === "auto" && wide()) return true
@@ -302,7 +330,7 @@ export function Session() {
   })
 
   useKeyboard((evt) => {
-    if (!session()?.parentID && currentAgentID() === "main") return
+    if (currentAgentID() === "main") return
     if (keybind.match("app_exit", evt)) {
       const status = sync.data.session_status?.[route.sessionID]
       if (status && status.type !== "idle") {
@@ -547,6 +575,32 @@ export function Session() {
           providerID: selectedModel.providerID,
         })
         dialog.clear()
+      },
+    },
+    {
+      title: t("tui.command.session.ask.title"),
+      description: t("tui.command.session.ask.description"),
+      value: "session.ask",
+      category: "session",
+      slash: {
+        name: "btw",
+      },
+      onSelect: async (dialog) => {
+        const question = await DialogPrompt.show(dialog, "/btw", {
+          placeholder: t("tui.command.session.ask.placeholder"),
+        })
+        if (!question || !question.trim()) return
+        const res = await sdk.client.session
+          .ask({ sessionID: route.sessionID, question: question.trim() })
+          .catch((error) => {
+            toast.show({
+              message: error instanceof Error ? error.message : "Failed to ask side question",
+              variant: "error",
+            })
+            return undefined
+          })
+        if (!res) return
+        await DialogAlert.show(dialog, "/btw", res.data?.answer ?? "(no answer)")
       },
     },
     {
@@ -1132,6 +1186,7 @@ export function Session() {
               />
             }
           >
+          
           <Show when={session()}>
             <scrollbox
               ref={(r) => (scroll = r)}
@@ -1255,7 +1310,7 @@ export function Session() {
               <Show when={permissions().length === 0 && questions().length > 0}>
                 <QuestionPrompt request={questions()[0]} />
               </Show>
-              <Show when={session()?.parentID || currentAgentID() !== "main"}>
+              <Show when={currentAgentID() !== "main"}>
                 <SubagentFooter />
               </Show>
               <Show when={visible()}>
@@ -1285,6 +1340,18 @@ export function Session() {
           </Show>
           <Toast />
         </box>
+        <Show when={wide() || sidebarVisible()}>
+          <SidebarToggleButton
+            visible={sidebarVisible()}
+            onToggle={() => {
+              batch(() => {
+                const isVisible = sidebarVisible()
+                setSidebar(() => (isVisible ? "hide" : "auto"))
+                setSidebarOpen(!isVisible)
+              })
+            }}
+          />
+        </Show>
         <Show when={sidebarVisible()}>
           <Switch>
             <Match when={wide()}>

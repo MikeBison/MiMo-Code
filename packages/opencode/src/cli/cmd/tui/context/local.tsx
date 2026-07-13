@@ -439,6 +439,32 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       }
     })
 
+    // skip-permissions: when on, permission asks auto-allow at runtime
+    // (instance-wide — subagents inherit). Deny rules and forced-ask
+    // permissions still apply. Same optimistic-update pattern as neverAsk.
+    const skipPermissions = iife(() => {
+      const [enabled, setEnabled] = createSignal(false)
+      return {
+        current: enabled,
+        set(value: boolean) {
+          const previous = enabled()
+          setEnabled(value)
+          void sdk.client.permission.setSkipAll({ enabled: value }).catch(() => {
+            setEnabled(previous)
+            toast.show({
+              variant: "error",
+              message: `Failed to ${value ? "enable" : "disable"} skip-permissions`,
+              duration: 4000,
+            })
+          })
+        },
+        toggle() {
+          this.set(!enabled())
+          return enabled()
+        },
+      }
+    })
+
     // Automatically update model when agent changes
     createEffect(() => {
       const value = agent.current()
@@ -463,6 +489,7 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       agent,
       mcp,
       neverAsk,
+      skipPermissions,
     }
     return result
   },

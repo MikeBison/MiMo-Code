@@ -8,7 +8,7 @@ import { Log } from "../util"
 import { SessionRevert } from "./revert"
 import * as Session from "./session"
 import { Agent } from "../agent/agent"
-import { SYSTEM_SPAWNED_AGENT_TYPES } from "@/agent/config"
+import { decideAskRouting } from "@/agent/config"
 import { Provider } from "../provider"
 import { ModelID, ProviderID } from "../provider/schema"
 import {
@@ -54,6 +54,7 @@ import {
   TEXT_NGRAM_RECOVERY_REPLAN,
 } from "../session/prompt/text-ngram-detection"
 import { composeSkillsBlock } from "@/skill/compose/extract"
+import { builtinSkillRoot, matchDocumentSkills } from "@/skill/builtin/extract"
 import { ToolRegistry } from "../tool"
 import { MCP } from "../mcp"
 import { LSP } from "../lsp"
@@ -178,6 +179,33 @@ function stepSignature(parts: MessageV2.Part[]): string | undefined {
   return segments.join("\n")
 }
 
+/**
+ * Debounce decision for the high-context-pressure memory-flush nudge.
+ *
+ * Returns true if a nudge (a text part containing `marker`) has already been
+ * injected within the *current high-pressure episode*, where the episode is the
+ * message window since the last checkpoint boundary.
+ *
+ * Keying off the checkpoint boundary rather than a fixed message count is
+ * deliberate: a single sustained high-pressure turn can emit many tool-call
+ * steps — each its own message — so a fixed-size tail would let the
+ * already-nudged message slide out of the window and re-fire the nudge
+ * mid-turn. The boundary only advances when a checkpoint/rebuild actually
+ * discards context, which is exactly when a fresh nudge becomes useful again.
+ *
+ * When `boundaryID` is undefined (no checkpoint yet) or is not found in `msgs`,
+ * the whole conversation is treated as the current episode.
+ */
+export function nudgedSinceBoundary(
+  msgs: readonly MessageV2.WithParts[],
+  boundaryID: string | undefined,
+  marker: string,
+): boolean {
+  const boundaryIdx = boundaryID ? msgs.findIndex((m) => m.info.id === boundaryID) : -1
+  const episode = boundaryIdx >= 0 ? msgs.slice(boundaryIdx) : msgs
+  return episode.some((m) => m.parts.some((p) => p.type === "text" && p.text?.includes(marker)))
+}
+
 const STRUCTURED_OUTPUT_DESCRIPTION = `Use this tool to return your final response in the requested structured format.
 
 IMPORTANT:
@@ -198,8 +226,11 @@ const TEXT_TOOL_CALL_RETRY_LIMIT = Flag.MIMOCODE_TEXT_TOOL_CALL_RETRY_LIMIT
 
 const log = Log.create({ service: "session.prompt" })
 
+// Hooks are NOT listed here: the plugin layer detects hook file changes
+// itself via mtime staleness checks (covers external editors too), so only
+// tools and skills need the write/edit-triggered registry reload.
 function isExtensionPath(filePath: string): boolean {
-  return /\/\.mimocode\/(tools?|skills?|hooks?)\//.test(filePath)
+  return /\/\.mimocode\/(tools?|skills?)\//.test(filePath)
 }
 const elog = EffectLogger.create({ service: "session.prompt" })
 
@@ -300,7 +331,7 @@ export const layer = Layer.effect(
         // ③ 并行准备系统提示的三块来源:技能、运行环境信息、全局指令(instructions)。
         const [skills, env, instructions] = yield* Effect.all([
           sys.skills(ag),
-          Effect.sync(() => sys.environment(model, captureSession.time.created)),
+          sys.environment(model, captureSession.time.created),
           instruction.system().pipe(Effect.orDie),
         ])
         // (checkpoint-writer 不要求 json_schema 输出,所以这里不含结构化输出的系统提示;
@@ -573,26 +604,124 @@ export const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         const composeCfg = (yield* config.get()).compose
         const docsDir = ConfigCompose.resolveDocsDir(ctx.worktree, composeCfg)
-        const composeDocsBlock = [
-          "<compose_docs_dir>",
-          `Save compose skill outputs: specs in \`${path.join(docsDir, "specs")}\`, plans in \`${path.join(docsDir, "plans")}\`, reports in \`${path.join(docsDir, "reports")}\`.`,
-          "</compose_docs_dir>",
-        ].join("\n")
+        const text = PROMPT_COMPOSE
+          .replace("{{compose_skills}}", composeModeBlock)
+          .replace("{{compose_docs_dir}}", `Save compose skill outputs: specs in \`${path.join(docsDir, "specs")}\`, plans in \`${path.join(docsDir, "plans")}\`, reports in \`${path.join(docsDir, "reports")}\`.`)
         composeModeMsg.parts.unshift({
           id: PartID.ascending(),
           messageID: composeModeMsg.info.id,
           sessionID: composeModeMsg.info.sessionID,
           type: "text",
-          text:
-            PROMPT_COMPOSE +
-            (composeModeBlock ? "\n\n" + composeModeBlock : "") +
-            "\n\n" +
-            composeDocsBlock,
+          text,
           synthetic: true,
         })
       }
 
       const assistantMessage = input.messages.findLast((msg) => msg.info.role === "assistant")
+      if (!Flag.MIMOCODE_DISABLE_BUILTIN_SKILLS && !Flag.MIMOCODE_DISABLE_OFFICIAL_SKILLS) {
+        const fileCandidates = userMessage.parts.flatMap((p) => {
+          if (p.type !== "file") return []
+          const filenameFromSource =
+            p.source?.type === "file" && p.source.path ? path.basename(p.source.path) : undefined
+          return [{ mime: p.mime, filename: p.filename ?? filenameFromSource }]
+        })
+        const skills = matchDocumentSkills(fileCandidates)
+        if (skills.length > 0) {
+          const root = builtinSkillRoot()
+          const entries = skills.map((skill) => `- ${skill}: ${path.join(root, skill, "SKILL.md")}`).join("\n")
+          const part = yield* sessions.updatePart({
+            id: PartID.ascending(),
+            messageID: userMessage.info.id,
+            sessionID: userMessage.info.sessionID,
+            type: "text",
+            text: `<system-reminder>
+The user's message attaches office document file(s). The following built-in skill(s) may be relevant for producing, reading, or transforming these files. You are recommended to consult the SKILL.md when it fits the task — prefer using these skills over ad-hoc approaches when applicable:
+${entries}
+</system-reminder>`,
+            synthetic: true,
+          })
+          userMessage.parts.push(part)
+        }
+      }
+
+      // Explicit multi-skill mentions in free text ("/foo ... /bar ..."). This
+      // is separate from the SessionPrompt.command single-command path, which
+      // already wraps SKILL.md content itself. Guard against double-wrapping
+      // by checking whether userMessage.parts already contains such a block.
+      const alreadyWrapped = userMessage.parts.some(
+        (p) => p.type === "text" && p.text.startsWith('<skill_content name="'),
+      )
+      if (!alreadyWrapped) {
+        const availableSkills = yield* sys.available(input.agent)
+        if (availableSkills.length > 0) {
+          const bodyText = userMessage.parts
+            .flatMap((p) => (p.type === "text" ? [p.text] : []))
+            .join("\n")
+          const stripped = bodyText
+            .replace(/```[\s\S]*?```/g, " ")
+            .replace(/`[^`\n]*`/g, " ")
+          const mentioned: string[] = []
+          const seen = new Set<string>()
+          const mentionRe = /(?:^|\s)\/([A-Za-z][A-Za-z0-9_-]*)(?=[^A-Za-z0-9_-]|$)/g
+          for (const m of stripped.matchAll(mentionRe)) {
+            const name = m[1]
+            if (!name || seen.has(name)) continue
+            if (!availableSkills.some((s) => s.name === name)) continue
+            seen.add(name)
+            mentioned.push(name)
+          }
+
+          if (mentioned.length > 0) {
+            const MAX_AUTOLOAD = 3
+            const toLoad = mentioned.slice(0, MAX_AUTOLOAD)
+            const overflow = mentioned.slice(MAX_AUTOLOAD)
+            for (const name of toLoad) {
+              const info = availableSkills.find((s) => s.name === name)
+              if (!info) continue
+              const part = yield* sessions.updatePart({
+                id: PartID.ascending(),
+                messageID: userMessage.info.id,
+                sessionID: userMessage.info.sessionID,
+                type: "text",
+                text: `<skill_content name="${name}">\n${info.content}\n</skill_content>`,
+                synthetic: true,
+              })
+              userMessage.parts.push(part)
+            }
+
+            if (mentioned.length >= 2) {
+              const loadedHint = toLoad.length > 0
+                ? `SKILL.md for [${toLoad.join(", ")}] has been auto-loaded above.`
+                : ""
+              const overflowHint = overflow.length > 0
+                ? `For [${overflow.join(", ")}], use the Skill tool to load them on demand.`
+                : ""
+              const part = yield* sessions.updatePart({
+                id: PartID.ascending(),
+                messageID: userMessage.info.id,
+                sessionID: userMessage.info.sessionID,
+                type: "text",
+                text: `<system-reminder>
+The user has explicitly referenced multiple skills in this message: ${mentioned.join(", ")}.
+${loadedHint} ${overflowHint}
+
+Before starting work, complete an orchestration plan:
+1. Read the SKILL.md of every referenced skill FIRST, then plan (never plan from skill descriptions alone — the full SKILL.md may contain constraints that invalidate an imagined workflow)
+2. Classify the composition relationship: pipeline (A's output → B's input) / parallel (each handles a separate part) / constraint overlay (one does the work, the other provides rules or standards)
+3. If pipeline: define the interface contract for intermediate artifacts — format and file path
+4. If two skills give instructions on the same dimension (output format / style / process), explicitly declare a conflict resolution rule: which skill takes precedence on which dimension
+5. Output a concise workflow (phase → skill used → artifact), then execute according to it
+
+Keep planning proportional to task complexity: for simple combinations, two or three sentences suffice.
+</system-reminder>`,
+                synthetic: true,
+              })
+              userMessage.parts.push(part)
+            }
+          }
+        }
+      }
+
       if (input.agent.name !== "plan" && assistantMessage?.info.agent === "plan") {
         const plan = Session.plan(input.session)
         if (!(yield* fsys.existsSafe(plan))) return input.messages
@@ -745,9 +874,24 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       const askActor = input.agentID
         ? yield* actorRegistry.get(input.session.id, input.agentID)
         : undefined
-      const askNonInteractive = askActor
-        ? SYSTEM_SPAWNED_AGENT_TYPES.has(askActor.agent) || askActor.background
-        : SYSTEM_SPAWNED_AGENT_TYPES.has(input.agent.name)
+      // Three-way permission-ask routing (see decideAskRouting): system agent ->
+      // auto-deny; orchestrator peer -> FORWARD for approval; other background ->
+      // auto-deny; normal -> interactive.
+      const askRouting = decideAskRouting({
+        askActor: askActor
+          ? {
+              agent: askActor.agent,
+              background: askActor.background,
+              mode: askActor.mode,
+              parentActorID: askActor.parentActorID,
+            }
+          : undefined,
+        sessionParentID: input.session.parentID,
+        agentName: input.agent.name,
+        orchestratorEnabled: Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR,
+      })
+      const askInteractive = askRouting.interactive
+      const askForward = askRouting.forward
       const rejectionFor = (toolID: string) => ({
         title: "Tool not permitted",
         output: `The "${toolID}" tool is not in this actor's whitelist. Allowed tools: ${
@@ -788,10 +932,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 sessionID: input.session.id,
                 tool: { messageID: input.processor.message.id, callID: options.toolCallId },
                 ruleset: Agent.runtimePermission(input.agent, input.session.permission),
-                // System-spawned background agents (checkpoint-writer, dream, distill)
-                // AND any background actor (e.g. compose workflow subagents) have no
-                // human to answer a permission prompt — fail clean, don't hang.
-                interactive: !askNonInteractive,
+                // System-spawned + non-peer background agents have no human to answer
+                // → fail clean, don't hang. Orchestrator peers FORWARD for approval.
+                interactive: askInteractive,
+                ...(askForward ? { forward: askForward } : {}),
               },
               options.abortSignal,
             )
@@ -2739,17 +2883,37 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             continue
           }
 
-          // Memory flush nudge at high context pressure
+          // Memory flush nudge at high context pressure.
+          //
+          // Purpose: at high context fill, the session may soon checkpoint and
+          // discard old context, so remind the model to externalize durable
+          // learnings to memory BEFORE that happens. This is a *save-your-work*
+          // reminder, NOT a signal to wrap up.
+          //
+          // Two failure modes this guards against (both observed in prod):
+          //   1. Wording that reads as "we're about to reset — wind down" made
+          //      models prematurely end their turn and hand control back to the
+          //      user mid-task. The text below is explicit: persist memory, then
+          //      KEEP GOING; do not end the turn.
+          //   2. Re-injecting the nudge on every user turn while pressure stays
+          //      high turned a one-time heads-up into per-turn nagging. We now
+          //      dedup across the recent conversation window, not just the
+          //      current user message.
           if (lastFinished && lastFinished.summary !== true && model) {
             const cfg = yield* config.get()
             const pressure = pressureLevel({ cfg, tokens: lastFinished.tokens, model })
             if (pressure >= 2) {
-              // Inject nudge as a synthetic text part on the last user message
+              // De-bounce: nudge at most once per high-pressure episode (the
+              // window since the last checkpoint boundary). See
+              // nudgedSinceBoundary for why the boundary — not a fixed message
+              // count — is the right anchor.
+              const NUDGE_MARKER = "Context is filling up"
+              const boundaryID = yield* checkpoint
+                .lastBoundary(sessionID)
+                .pipe(Effect.catch(() => Effect.succeed(undefined)))
+              const alreadyNudged = nudgedSinceBoundary(msgs, boundaryID, NUDGE_MARKER)
               const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
-              if (
-                lastUserMsg &&
-                !lastUserMsg.parts.some((p) => p.type === "text" && p.text?.includes("Context is filling up"))
-              ) {
+              if (lastUserMsg && !alreadyNudged) {
                 lastUserMsg.parts.push({
                   id: PartID.ascending(),
                   messageID: lastUserMsg.info.id,
@@ -2759,8 +2923,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   text: [
                     "<system-reminder>",
                     `Context is filling up (${pressure >= 3 ? ">85%" : ">70%"}).`,
-                    "If you have important learnings or decisions from this session,",
-                    "consider writing them to memory now before context may be reset.",
+                    "If you have important learnings or decisions from this session that are",
+                    "not yet in memory, write them now (they may be summarized on the next",
+                    "checkpoint). This is a save-your-work reminder only.",
+                    "IMPORTANT: After writing to memory, CONTINUE with the current task in the",
+                    "same turn. Do NOT stop, wrap up, or hand control back to the user because",
+                    "of this reminder — only finish when the actual work is done.",
                     "</system-reminder>",
                   ].join("\n"),
                 })
@@ -3226,7 +3394,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
             const [skills, env, instructions] = yield* Effect.all([
               sys.skills(agent),
-              Effect.sync(() => sys.environment(model, session.time.created)),
+              sys.environment(model, session.time.created),
               instruction.system().pipe(Effect.orDie),
             ])
             // Surface which instruction files (CLAUDE.md, AGENTS.md, ...) were loaded.

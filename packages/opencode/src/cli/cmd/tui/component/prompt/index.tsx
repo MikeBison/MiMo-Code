@@ -1128,6 +1128,22 @@ export function Prompt(props: PromptProps) {
         command: inputText,
       })
       setStore("mode", "normal")
+    } else if (inputText.startsWith("/btw ")) {
+      // Inline side-question form: `/btw <question>` on the prompt line. Client
+      // slashes match the exact `/btw` token and drop args, so handle the
+      // arg-bearing form here. READ-ONLY + EPHEMERAL: render the answer in a
+      // dismissible dialog, never inject it into the conversation.
+      const question = inputText.slice("/btw ".length).trim()
+      if (question)
+        void sdk.client.session
+          .ask({ sessionID, question })
+          .then((res) => DialogAlert.show(dialog, "/btw", res.data?.answer ?? "(no answer)"))
+          .catch((err) => {
+            toast.show({
+              message: err instanceof Error ? err.message : "Failed to ask side question",
+              variant: "error",
+            })
+          })
     } else if (clientSlash) {
       clientSlash.onSelect?.()
     } else if (
@@ -1276,6 +1292,11 @@ export function Prompt(props: PromptProps) {
           }
         }
         if (mime.startsWith("image/") || mime === "application/pdf") {
+          if (mime.startsWith("image/") && !activeModelSupportsImage()) {
+            insertFileReference(filepath)
+            toast.show({ message: t("tui.paste.image.fallback_path"), variant: "warning", duration: 5000 })
+            return
+          }
           const content = await Filesystem.readArrayBuffer(filepath)
             .then((buffer) => Buffer.from(buffer).toString("base64"))
             .catch(() => {})
@@ -1309,16 +1330,62 @@ export function Prompt(props: PromptProps) {
     }, 0)
   }
 
+  function activeModelSupportsImage() {
+    const current = local.model.current()
+    if (!current) return false
+    const provider = sync.data.provider.find((p) => p.id === current.providerID)
+    return provider?.models[current.modelID]?.capabilities?.input?.image ?? false
+  }
+
+  function insertFileReference(filepath: string) {
+    const filename = path.basename(filepath)
+    const currentOffset = input.visualCursor.offset
+    const extmarkStart = currentOffset
+    const virtualText = `@${filename}`
+    const extmarkEnd = extmarkStart + virtualText.length
+    input.insertText(virtualText + " ")
+    const extmarkId = input.extmarks.create({
+      start: extmarkStart,
+      end: extmarkEnd,
+      virtual: true,
+      styleId: fileStyleId,
+      typeId: promptPartTypeId,
+    })
+    setStore(
+      produce((draft) => {
+        const partIndex = draft.prompt.parts.length
+        draft.prompt.parts.push({
+          type: "file" as const,
+          mime: "text/plain",
+          filename,
+          url: `file://${filepath}`,
+          source: {
+            type: "file",
+            path: filepath,
+            text: { start: extmarkStart, end: extmarkEnd, value: virtualText },
+          },
+        })
+        draft.extmarkToPartIndex.set(extmarkId, partIndex)
+      }),
+    )
+  }
+
   async function pasteFromClipboard() {
     if (props.disabled) return
     const content = await Clipboard.read()
     if (!content) return
     if (content.mime.startsWith("image/")) {
-      await pasteAttachment({
-        filename: "clipboard",
-        mime: content.mime,
-        content: content.data,
-      })
+      if (activeModelSupportsImage()) {
+        await pasteAttachment({
+          filename: "clipboard",
+          mime: content.mime,
+          content: content.data,
+        })
+        return
+      }
+      const filepath = await Clipboard.spillImage(content)
+      insertFileReference(filepath)
+      toast.show({ message: t("tui.paste.image.fallback_path"), variant: "warning", duration: 5000 })
       return
     }
     await pastePlainText(content.data.replace(/\r\n/g, "\n").replace(/\r/g, "\n"))

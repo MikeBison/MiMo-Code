@@ -362,6 +362,57 @@ describe("ProviderTransform.options - gpt-5 textVerbosity", () => {
     const result = ProviderTransform.options({ model, sessionID, providerOptions: {} })
     expect(result.textVerbosity).toBeUndefined()
   })
+
+  test("gpt-5.5 should request encrypted reasoning via include (store:false round-trip)", () => {
+    const model = createGpt5Model("gpt-5.5")
+    const result = ProviderTransform.options({ model, sessionID, providerOptions: {} })
+    expect(result.store).toBe(false)
+    expect(result.include).toEqual(["reasoning.encrypted_content"])
+  })
+
+  test("gpt-5 should request encrypted reasoning via include", () => {
+    const model = createGpt5Model("gpt-5")
+    const result = ProviderTransform.options({ model, sessionID, providerOptions: {} })
+    expect(result.include).toEqual(["reasoning.encrypted_content"])
+  })
+
+  test("gpt-5-pro should NOT set include (pro path skips reasoning options)", () => {
+    const model = createGpt5Model("gpt-5-pro")
+    const result = ProviderTransform.options({ model, sessionID, providerOptions: {} })
+    expect(result.include).toBeUndefined()
+  })
+})
+
+describe("ProviderTransform.smallOptions - gpt-5 encrypted reasoning", () => {
+  const createModel = (apiId: string, npm: string, providerID = "openai") =>
+    ({
+      id: `${providerID}/${apiId}`,
+      providerID,
+      api: { id: apiId, url: "https://api.openai.com", npm },
+      name: apiId,
+    }) as any
+
+  test("gpt-5.5 small model requests encrypted reasoning (store:false round-trip)", () => {
+    const result = ProviderTransform.smallOptions(createModel("gpt-5.5", "@ai-sdk/openai")) as any
+    expect(result.store).toBe(false)
+    expect(result.reasoningEffort).toBe("low")
+    expect(result.include).toEqual(["reasoning.encrypted_content"])
+  })
+
+  test("gpt-5 small model requests encrypted reasoning", () => {
+    const result = ProviderTransform.smallOptions(createModel("gpt-5", "@ai-sdk/openai")) as any
+    expect(result.store).toBe(false)
+    expect(result.reasoningEffort).toBe("minimal")
+    expect(result.include).toEqual(["reasoning.encrypted_content"])
+  })
+
+  test("github-copilot small model does NOT set include (uses its own path)", () => {
+    const result = ProviderTransform.smallOptions(
+      createModel("gpt-5", "@ai-sdk/github-copilot", "github-copilot"),
+    ) as any
+    expect(result.store).toBe(false)
+    expect(result.include).toBeUndefined()
+  })
 })
 
 describe("ProviderTransform.options - gateway", () => {
@@ -1473,7 +1524,7 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
     headers: {},
   } as any
 
-  test("preserves itemId and reasoningEncryptedContent when store=false", () => {
+  test("strips openai itemId and preserves reasoningEncryptedContent when store=false", () => {
     const msgs = [
       {
         role: "assistant",
@@ -1504,11 +1555,13 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
     const result = ProviderTransform.message(msgs, openaiModel, { store: false }) as any[]
 
     expect(result).toHaveLength(1)
-    expect(result[0].content[0].providerOptions?.openai?.itemId).toBe("rs_123")
-    expect(result[0].content[1].providerOptions?.openai?.itemId).toBe("msg_456")
+    expect(result[0].content[0].providerOptions?.openai?.itemId).toBeUndefined()
+    expect(result[0].content[0].providerOptions?.openai?.reasoningEncryptedContent).toBe("encrypted")
+    expect(result[0].content[1].providerOptions?.openai?.itemId).toBeUndefined()
   })
 
-  test("preserves itemId and reasoningEncryptedContent when store=false even when not openai", () => {
+  test("strips itemId based on SDK package namespace, not provider ID", () => {
+    // Custom providerID but @ai-sdk/openai npm (e.g. a proxy) still strips via the openai key.
     const zenModel = {
       ...openaiModel,
       providerID: "zen",
@@ -1543,11 +1596,12 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
     const result = ProviderTransform.message(msgs, zenModel, { store: false }) as any[]
 
     expect(result).toHaveLength(1)
-    expect(result[0].content[0].providerOptions?.openai?.itemId).toBe("rs_123")
-    expect(result[0].content[1].providerOptions?.openai?.itemId).toBe("msg_456")
+    expect(result[0].content[0].providerOptions?.openai?.itemId).toBeUndefined()
+    expect(result[0].content[0].providerOptions?.openai?.reasoningEncryptedContent).toBe("encrypted")
+    expect(result[0].content[1].providerOptions?.openai?.itemId).toBeUndefined()
   })
 
-  test("preserves other openai options including itemId", () => {
+  test("strips itemId but preserves other openai options", () => {
     const msgs = [
       {
         role: "assistant",
@@ -1568,8 +1622,39 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
 
     const result = ProviderTransform.message(msgs, openaiModel, { store: false }) as any[]
 
-    expect(result[0].content[0].providerOptions?.openai?.itemId).toBe("msg_123")
+    expect(result[0].content[0].providerOptions?.openai?.itemId).toBeUndefined()
     expect(result[0].content[0].providerOptions?.openai?.otherOption).toBe("value")
+  })
+
+  test("strips Azure itemId from the azure namespace when store=false", () => {
+    const azureModel = {
+      ...openaiModel,
+      providerID: "azure",
+      api: {
+        id: "gpt-5",
+        url: "https://example.openai.azure.com",
+        npm: "@ai-sdk/azure",
+      },
+    }
+    const msgs = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: "Hello",
+            providerOptions: {
+              azure: { itemId: "msg_123", otherOption: "value" },
+            },
+          },
+        ],
+      },
+    ] as any[]
+
+    const result = ProviderTransform.message(msgs, azureModel, { store: false }) as any[]
+
+    expect(result[0].content[0].providerOptions?.azure?.itemId).toBeUndefined()
+    expect(result[0].content[0].providerOptions?.azure?.otherOption).toBe("value")
   })
 
   test("preserves metadata for openai package when store is true", () => {
@@ -1590,7 +1675,7 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
       },
     ] as any[]
 
-    // openai package preserves itemId regardless of store value
+    // store=true keeps itemId (stateful Responses API resolves items by id)
     const result = ProviderTransform.message(msgs, openaiModel, { store: true }) as any[]
 
     expect(result[0].content[0].providerOptions?.openai?.itemId).toBe("msg_123")
@@ -1614,7 +1699,7 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
             type: "text",
             text: "Hello",
             providerOptions: {
-              openai: {
+              anthropic: {
                 itemId: "msg_123",
               },
             },
@@ -1623,13 +1708,13 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
       },
     ] as any[]
 
-    // store=false preserves metadata for non-openai packages
+    // store=false does NOT strip for non-openai/azure packages
     const result = ProviderTransform.message(msgs, anthropicModel, { store: false }) as any[]
 
-    expect(result[0].content[0].providerOptions?.openai?.itemId).toBe("msg_123")
+    expect(result[0].content[0].providerOptions?.anthropic?.itemId).toBe("msg_123")
   })
 
-  test("preserves metadata using providerID key when store is false", () => {
+  test("preserves metadata using providerID key for openai-compatible packages", () => {
     const opencodeModel = {
       ...openaiModel,
       providerID: "opencode",
@@ -1659,50 +1744,9 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
 
     const result = ProviderTransform.message(msgs, opencodeModel, { store: false }) as any[]
 
+    // @ai-sdk/openai-compatible is not in the strip list, so itemId survives
     expect(result[0].content[0].providerOptions?.opencode?.itemId).toBe("msg_123")
     expect(result[0].content[0].providerOptions?.opencode?.otherOption).toBe("value")
-  })
-
-  test("preserves itemId across all providerOptions keys", () => {
-    const opencodeModel = {
-      ...openaiModel,
-      providerID: "opencode",
-      api: {
-        id: "opencode-test",
-        url: "https://api.mimocode.ai",
-        npm: "@ai-sdk/openai-compatible",
-      },
-    }
-    const msgs = [
-      {
-        role: "assistant",
-        providerOptions: {
-          openai: { itemId: "msg_root" },
-          opencode: { itemId: "msg_opencode" },
-          extra: { itemId: "msg_extra" },
-        },
-        content: [
-          {
-            type: "text",
-            text: "Hello",
-            providerOptions: {
-              openai: { itemId: "msg_openai_part" },
-              opencode: { itemId: "msg_opencode_part" },
-              extra: { itemId: "msg_extra_part" },
-            },
-          },
-        ],
-      },
-    ] as any[]
-
-    const result = ProviderTransform.message(msgs, opencodeModel, { store: false }) as any[]
-
-    expect(result[0].providerOptions?.openai?.itemId).toBe("msg_root")
-    expect(result[0].providerOptions?.opencode?.itemId).toBe("msg_opencode")
-    expect(result[0].providerOptions?.extra?.itemId).toBe("msg_extra")
-    expect(result[0].content[0].providerOptions?.openai?.itemId).toBe("msg_openai_part")
-    expect(result[0].content[0].providerOptions?.opencode?.itemId).toBe("msg_opencode_part")
-    expect(result[0].content[0].providerOptions?.extra?.itemId).toBe("msg_extra_part")
   })
 
   test("does not strip metadata for non-openai packages when store is not false", () => {
@@ -1723,7 +1767,7 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
             type: "text",
             text: "Hello",
             providerOptions: {
-              openai: {
+              anthropic: {
                 itemId: "msg_123",
               },
             },
@@ -1734,7 +1778,7 @@ describe("ProviderTransform.message - strip openai metadata when store=false", (
 
     const result = ProviderTransform.message(msgs, anthropicModel, {}) as any[]
 
-    expect(result[0].content[0].providerOptions?.openai?.itemId).toBe("msg_123")
+    expect(result[0].content[0].providerOptions?.anthropic?.itemId).toBe("msg_123")
   })
 })
 
@@ -3519,5 +3563,152 @@ describe("ProviderTransform.schema - openai discriminated-union flatten", () => 
     expect(result.type).toBe("object")
     expect(result.properties.a).toBeDefined()
     expect(result.anyOf).toBeUndefined()
+  })
+})
+
+describe("ProviderTransform.schema - moonshot combiner sibling type", () => {
+  // Real shape of the `operation` node emitted by task/actor/cron/session:
+  // z.discriminatedUnion(...).meta({ type: "object" }) serializes to
+  // { type: "object", anyOf: [...] } nested under a root strictObject (so
+  // flattenDiscriminatedUnion leaves it alone). oneOf is also covered — the
+  // transform handles it defensively.
+  const nested = (combiner: "oneOf" | "anyOf") =>
+    ({
+      type: "object",
+      properties: {
+        operation: {
+          type: "object",
+          [combiner]: [
+            {
+              type: "object",
+              properties: { action: { type: "string", const: "create" }, summary: { type: "string", minLength: 1 } },
+              required: ["action", "summary"],
+              additionalProperties: false,
+            },
+            {
+              type: "object",
+              properties: { action: { type: "string", const: "list" } },
+              required: ["action"],
+              additionalProperties: false,
+            },
+          ],
+        },
+      },
+      required: ["operation"],
+      additionalProperties: false,
+    }) as any
+
+  const moonshot = { providerID: "moonshotai", api: { id: "kimi-k2.7-code", npm: "@ai-sdk/openai-compatible" } } as any
+
+  test("moonshotai — drops the parent type sitting next to oneOf", () => {
+    const result = ProviderTransform.schema(moonshot, nested("oneOf")) as any
+    expect(result.properties.operation.type).toBeUndefined()
+    expect(Array.isArray(result.properties.operation.oneOf)).toBe(true)
+    // Variants keep their own type, so the meaning is preserved.
+    expect(result.properties.operation.oneOf.every((v: any) => v.type === "object")).toBe(true)
+    // Root object is untouched.
+    expect(result.type).toBe("object")
+    expect(result.required).toEqual(["operation"])
+  })
+
+  test("moonshotai — drops the parent type sitting next to anyOf", () => {
+    const result = ProviderTransform.schema(moonshot, nested("anyOf")) as any
+    expect(result.properties.operation.type).toBeUndefined()
+    expect(Array.isArray(result.properties.operation.anyOf)).toBe(true)
+  })
+
+  test("detects Kimi via model id even when the provider id is not moonshot (e.g. a gateway)", () => {
+    const gateway = { providerID: "opencode", api: { id: "kimi-k2.7-code", npm: "@ai-sdk/openai-compatible" } } as any
+    const result = ProviderTransform.schema(gateway, nested("oneOf")) as any
+    expect(result.properties.operation.type).toBeUndefined()
+  })
+
+  test("pushes the parent type into a combiner item that lacks its own, keeping the item's own keys", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        operation: {
+          type: "object",
+          anyOf: [
+            { properties: { action: { const: "x" }, note: { type: "string" } }, required: ["action"] },
+            { type: "object", properties: { action: { const: "y" } }, additionalProperties: false },
+          ],
+        },
+      },
+    } as any
+    const result = ProviderTransform.schema(moonshot, schema) as any
+    expect(result.properties.operation.type).toBeUndefined()
+    // The typeless variant inherits the parent type WITHOUT losing its own keys.
+    expect(result.properties.operation.anyOf[0].type).toBe("object")
+    expect(result.properties.operation.anyOf[0].properties.action.const).toBe("x")
+    expect(result.properties.operation.anyOf[0].properties.note.type).toBe("string")
+    expect(result.properties.operation.anyOf[0].required).toEqual(["action"])
+    // The already-typed variant is preserved untouched.
+    expect(result.properties.operation.anyOf[1].type).toBe("object")
+    expect(result.properties.operation.anyOf[1].properties.action.const).toBe("y")
+    expect(result.properties.operation.anyOf[1].additionalProperties).toBe(false)
+  })
+
+  test("matches Moonshot via provider id 'kimi-for-coding' and via 'moonshot' in the model id", () => {
+    // exercises the isMoonshot branches provider.includes('kimi') and apiID.includes('moonshot')
+    const kfc = { providerID: "kimi-for-coding", api: { id: "k2", npm: "@ai-sdk/anthropic" } } as any
+    expect((ProviderTransform.schema(kfc, nested("anyOf")) as any).properties.operation.type).toBeUndefined()
+    const byModelId = { providerID: "custom", api: { id: "moonshot-v1-8k", npm: "@ai-sdk/openai-compatible" } } as any
+    expect((ProviderTransform.schema(byModelId, nested("anyOf")) as any).properties.operation.type).toBeUndefined()
+  })
+
+  test("normalizes a combiner+type nested deep inside array items and additionalProperties", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        list: { type: "array", items: { type: "object", anyOf: [{ type: "object", properties: { k: { const: "a" } } }] } },
+        bag: { type: "object", additionalProperties: { type: "object", oneOf: [{ type: "object", properties: { k: { const: "b" } } }] } },
+      },
+    } as any
+    const result = ProviderTransform.schema(moonshot, schema) as any
+    expect(result.properties.list.items.type).toBeUndefined()
+    expect(Array.isArray(result.properties.list.items.anyOf)).toBe(true)
+    expect(result.properties.bag.additionalProperties.type).toBeUndefined()
+    expect(Array.isArray(result.properties.bag.additionalProperties.oneOf)).toBe(true)
+    // The array/object containers keep their own type.
+    expect(result.properties.list.type).toBe("array")
+    expect(result.properties.bag.type).toBe("object")
+  })
+
+  test("leaves a combiner that has NO sibling type untouched", () => {
+    const schema = {
+      type: "object",
+      properties: { operation: { anyOf: [{ type: "object", properties: { a: { const: "x" } } }] } },
+    } as any
+    const result = ProviderTransform.schema(moonshot, schema) as any
+    expect("type" in result.properties.operation).toBe(false)
+    expect(result.properties.operation.anyOf[0].type).toBe("object")
+  })
+
+  test("non-moonshot models keep the parent type (guards the mimo/MiniMax stringify mitigation, #1371)", () => {
+    const mimo = { providerID: "mimo", api: { id: "mimo-v2.5-pro", npm: "@ai-sdk/openai-compatible" } } as any
+    const result = ProviderTransform.schema(mimo, nested("oneOf")) as any
+    expect(result.properties.operation.type).toBe("object")
+    expect(Array.isArray(result.properties.operation.oneOf)).toBe(true)
+  })
+
+  test("leaves allOf + type untouched (only anyOf/oneOf are rejected by Moonshot)", () => {
+    const schema = {
+      type: "object",
+      properties: {
+        operation: { type: "object", allOf: [{ type: "object", properties: { a: { type: "string" } } }] },
+      },
+    } as any
+    const result = ProviderTransform.schema(moonshot, schema) as any
+    expect(result.properties.operation.type).toBe("object")
+    expect(Array.isArray(result.properties.operation.allOf)).toBe(true)
+  })
+
+  test("does not mutate the input schema", () => {
+    const input = nested("anyOf")
+    const snapshot = JSON.stringify(input)
+    ProviderTransform.schema(moonshot, input)
+    expect(JSON.stringify(input)).toBe(snapshot)
+    expect(input.properties.operation.type).toBe("object")
   })
 })

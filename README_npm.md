@@ -17,11 +17,15 @@ MiMo Auto is built in as a free-for-limited-time channel, so you can start with 
 ## Quick Start
 
 ```bash
-# One-line install
+# One-line install (macOS / Linux)
 curl -fsSL https://mimo.xiaomi.com/install | bash
 
-# Or install via npm
-npm install -g @mimo-ai/cli
+# One-line install (Windows PowerShell)
+powershell -ep Bypass -c "irm https://mimo.xiaomi.com/install.ps1 | iex"
+
+# Or install via npm (all platforms)
+# Mirror registries (e.g. cnpm/taobao) may have delayed platform package sync
+npm install -g @mimo-ai/cli --registry https://registry.npmjs.org
 
 # Run
 mimo

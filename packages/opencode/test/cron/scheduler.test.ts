@@ -256,6 +256,7 @@ test("same-tick double-fire: only the first due task fires per tick", async () =
         ...baseStartOpts(dir),
         isLoading: () => false,
         onFire: (t) => fires.push(t.id),
+        jitterConfig: { ...DEFAULT_JITTER, recurringFrac: 0 },
       })
 
       const past = Date.now() - 61_000

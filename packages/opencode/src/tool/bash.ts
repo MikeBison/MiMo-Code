@@ -23,6 +23,7 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import * as BashInteractive from "./bash-interactive"
 import * as BashTokenEfficient from "./bash_token_efficient_pipeline"
+import * as BashTokenEfficientHeuristic from "./bash_token_efficient_heuristic"
 
 const MAX_METADATA_LENGTH = 30_000
 const DEFAULT_TIMEOUT = Flag.MIMOCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS || 2 * 60 * 1000
@@ -52,6 +53,36 @@ const FILES = new Set([
 ])
 const FLAGS = new Set(["-destination", "-literalpath", "-path"])
 const SWITCHES = new Set(["-confirm", "-debug", "-force", "-nonewline", "-recurse", "-verbose", "-whatif"])
+
+// Irreversible file/directory removal commands. Names are matched
+// case-insensitively for PowerShell; bash is case-sensitive.
+const DELETE_COMMANDS = new Set([
+  "rm",
+  "rmdir",
+  "unlink",
+  "shred",
+  // Windows / PowerShell removal verbs and their common aliases. `remove-item`
+  // is the canonical verb; `ri`, `rd`, `del`, `erase` are aliases.
+  "del",
+  "erase",
+  "rd",
+  "remove-item",
+  "ri",
+])
+
+// git subcommands that destroy history, working tree state, or remote branches.
+// Value is the set of tokens (flag or subcommand keyword) that must appear
+// anywhere in the argv for the invocation to count as destructive. An empty
+// set means the subcommand is destructive on its own.
+const GIT_DESTRUCTIVE = new Map<string, Set<string>>([
+  ["reset", new Set(["--hard"])],
+  ["clean", new Set(["-f", "-ff", "-fd", "-fdx", "-df", "-dfx", "-fx", "--force"])],
+  ["branch", new Set(["-D", "--delete"])],
+  ["tag", new Set(["-d", "--delete"])],
+  ["worktree", new Set(["remove"])],
+  ["push", new Set(["--force", "-f"])],
+  ["stash", new Set(["drop", "clear"])],
+])
 
 const Parameters = z.object({
   command: z.string().describe("The command to execute"),
@@ -84,6 +115,7 @@ type Scan = {
   dirs: Set<string>
   patterns: Set<string>
   always: Set<string>
+  deletes: Set<string>
 }
 
 type Chunk = {
@@ -134,6 +166,24 @@ function source(node: Node) {
 
 function commands(node: Node) {
   return node.descendantsOfType("command").filter((child): child is Node => Boolean(child))
+}
+
+// Returns true when `tokens` (the flat argv of a single command node) invokes
+// an irreversible deletion — either a direct removal command (rm, remove-item,
+// …) or a destructive git subcommand (git reset --hard, git clean -f, …).
+// `ps` toggles PowerShell case-insensitive matching.
+function isDelete(tokens: string[], ps: boolean) {
+  if (tokens.length === 0) return false
+  const head = ps ? tokens[0].toLowerCase() : tokens[0]
+  if (DELETE_COMMANDS.has(head)) return true
+  if (head === "git" && tokens.length >= 2) {
+    const sub = tokens[1]
+    const flags = GIT_DESTRUCTIVE.get(sub)
+    if (!flags) return false
+    if (flags.size === 0) return true
+    return tokens.slice(2).some((tok) => flags.has(tok))
+  }
+  return false
 }
 
 function unquote(text: string) {
@@ -307,6 +357,24 @@ const ask = Effect.fn("BashTool.ask")(function* (ctx: Tool.Context, scan: Scan) 
   })
 })
 
+// Secondary confirmation for irreversible deletion commands. Uses its own
+// permission type ("bash_delete"), which the Permission layer flags as
+// forced-ask: no `allow` rule (not even a broad `"*": allow`) can silently
+// pre-approve it — only an explicit `deny` blocks. `always` is empty because
+// a persisted "allow all deletes" rule is exactly what forced-ask exists to
+// prevent. The delete UI shows the full command, so this ask FULLY replaces
+// the regular bash/external_directory prompts when it fires (see the caller
+// below) — deletion is authorized in a single, unambiguous confirmation.
+const askDelete = Effect.fn("BashTool.askDelete")(function* (ctx: Tool.Context, scan: Scan, command: string) {
+  const patterns = Array.from(scan.deletes)
+  yield* ctx.ask({
+    permission: "bash_delete",
+    patterns,
+    always: [],
+    metadata: { command, deletes: patterns },
+  })
+})
+
 function cmd(shell: string, name: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
   if (process.platform === "win32" && PS.has(name)) {
     const prefixed = `${Shell.POWERSHELL_UTF8_PREFIX}${command}`
@@ -400,6 +468,7 @@ export const BashTool = Tool.define(
         dirs: new Set<string>(),
         patterns: new Set<string>(),
         always: new Set<string>(),
+        deletes: new Set<string>(),
       }
 
       for (const node of commands(root)) {
@@ -421,6 +490,8 @@ export const BashTool = Tool.define(
           scan.patterns.add(source(node))
           scan.always.add(BashArity.prefix(tokens).join(" ") + " *")
         }
+
+        if (isDelete(tokens, ps)) scan.deletes.add(source(node))
       }
 
       return scan
@@ -586,7 +657,25 @@ export const BashTool = Tool.define(
         })
       }
 
-      let output = cleaned?.text ?? end.text
+      // Heuristic (shape-based) pipeline runs AFTER the common pipeline and
+      // only when both flags are on. Same never-worse contract — a shape that
+      // doesn't shrink the bytes is discarded.
+      const heuristic =
+        !file &&
+        Flag.MIMOCODE_EXPERIMENTAL_TOKEN_EFFICIENCY &&
+        Flag.MIMOCODE_EXPERIMENTAL_TOKEN_EFFICIENCY_HEURISTIC
+          ? BashTokenEfficientHeuristic.cleanHeuristic(cleaned?.text ?? end.text, { command: input.command })
+          : null
+      if (heuristic && heuristic.bytesOut < heuristic.bytesIn) {
+        log.info("bash output heuristic cleaned", {
+          shape: heuristic.shape,
+          bytesIn: heuristic.bytesIn,
+          bytesOut: heuristic.bytesOut,
+          saved: heuristic.bytesIn - heuristic.bytesOut,
+        })
+      }
+
+      let output = heuristic?.text ?? cleaned?.text ?? end.text
       if (!output) output = "(no output)"
 
       if (cut && file) {
@@ -670,7 +759,17 @@ export const BashTool = Tool.define(
               const root = yield* parse(params.command, ps)
               const scan = yield* collect(root, cwd, ps, shell)
               if (!Instance.containsPath(cwd)) scan.dirs.add(cwd)
-              yield* ask(ctx, scan)
+              // Delete-containing commands are authorized by askDelete alone —
+              // the delete UI shows the full command (including any external
+              // paths it touches), so a separate bash/external_directory
+              // prompt would just be a second confirmation of the same thing.
+              // MIMOCODE_AUTO_APPROVE_DELETE trusts deletes and falls back to
+              // the regular ask (where a `bash: deny` rule still blocks).
+              if (scan.deletes.size > 0 && !Flag.MIMOCODE_AUTO_APPROVE_DELETE) {
+                yield* askDelete(ctx, scan, params.command)
+              } else {
+                yield* ask(ctx, scan)
+              }
 
               // Interactive mode: hand terminal to user for direct interaction
               if (params.interactive) {
