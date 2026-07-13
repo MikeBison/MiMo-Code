@@ -56,9 +56,9 @@ export const Info = z
     temperature: z.number().optional(), // 温度，透传给模型
     color: z.string().optional(), // UI 里显示用的主题色
     permission: Permission.Ruleset.zod, // 权限规则集：这个 agent 能用哪些工具/能碰哪些目录
-    // Non-overridable rules appended AFTER the user/session permissions during
-    // runtime evaluation (see runtimePermission). Use for agent invariants that
-    // config must not be able to relax — e.g. plan mode's edit/write block.
+    // 不可被覆盖的规则。运行时求值时，它会在"用户/会话权限"之后再追加一次
+    //（见 runtimePermission），用于表达"配置绝不能放宽"的 agent 硬性约束，
+    // 例如 plan 模式对 edit/write 的禁止。
     hardPermission: Permission.Ruleset.zod.optional(),
     // 指定这个 agent 用哪个模型（完整写死 provider + model）
     model: z
@@ -107,10 +107,9 @@ type State = Omit<Interface, "generate">
 // 别的模块写 `yield* Agent.Service` 就能拿到一个实现了 Interface 的实例。
 export class Service extends Context.Service<Service, Interface>()("@opencode/Agent") {}
 
-// Merge an agent's permission with the user/session ruleset, then re-append the
-// agent's hardPermission so those invariants win over any allow rule a user or
-// session approval could introduce. Every permission-evaluation site routes
-// through this — there is no per-agent name special-casing.
+// 把 agent 的 permission 与"用户/会话规则集"合并，然后再把 agent 的 hardPermission
+// 追加到最后，从而让这些硬性约束胜过用户或会话审批可能引入的任何 allow 规则。
+// 所有做权限求值的地方都走这个函数——不存在按 agent 名字做特判的逻辑。
 export function runtimePermission(agent: Info, permission?: Permission.Ruleset) {
   return Permission.merge(agent.permission, permission ?? [], agent.hardPermission ?? [])
 }
@@ -151,7 +150,7 @@ export const layer = Layer.effect(
             ...Object.fromEntries(whitelistedDirs.map((dir) => [dir, "allow"])),
           },
           question: "deny",
-          // mirrors github.com/github/gitignore Node.gitignore pattern for .env files
+          // 对齐 github.com/github/gitignore 里 Node.gitignore 针对 .env 文件的模式
           read: {
             "*": "allow",
             "*.env": "ask",
@@ -184,9 +183,8 @@ export const layer = Layer.effect(
             mode: "primary",
             native: true,
           },
-          // Max mode is experimental and opt-in: only registered when
-          // `experimental.maxMode` is configured. This keeps the default agent
-          // set as {build, plan, compose} when the feature is off.
+          // Max 模式是实验性的、需显式开启：仅当配置了 `experimental.maxMode` 时才注册。
+          // 这样在该功能关闭时，默认 agent 集合仍保持为 {build, plan, compose}。
           ...(cfg.experimental?.maxMode
             ? {
                 max: {
@@ -223,18 +221,14 @@ export const layer = Layer.effect(
               }),
               user,
             ),
-            // Plan mode's one hard invariant: writes to non-plan files are
-            // blocked and user/session config must NOT be able to relax it.
-            // Re-appended after the user merge by runtimePermission so it always
-            // wins. (Every write tool — write/edit/multiedit/apply_patch/
-            // notebook_edit — funnels through ctx.ask({ permission: "edit" }),
-            // so this single rule governs all file writes.) Deliberately scoped
-            // to edit only: bash/change_directory/workflow are left to the
-            // model's own read-only discipline + plan prompt, matching the
-            // project's "trust the model, permission layer is a backstop"
-            // stance. The "*":"deny" carries a non-"*" allow exception, so the
-            // edit tool stays in the schema (no tool-list mutation on mode
-            // switch, see PR #1207).
+            // plan 模式唯一的硬性不变式：禁止写入"非计划文件"，且用户/会话配置绝不能放宽它。
+            // 通过 runtimePermission 在用户合并之后再追加，因此它永远胜出。
+            //（每个写入工具——write/edit/multiedit/apply_patch/notebook_edit——都汇聚到
+            // ctx.ask({ permission: "edit" })，所以这一条规则就能管住所有文件写入。）
+            // 刻意只作用于 edit：bash/change_directory/workflow 交给模型自身的只读自律
+            // 加上 plan 提示词来约束，符合本项目"信任模型、权限层只作兜底"的立场。
+            // "*":"deny" 里带有一个非 "*" 的 allow 例外，因此 edit 工具仍留在 schema 中
+            //（切换模式时不会改动工具列表，见 PR #1207）。
             hardPermission: Permission.fromConfig({
               edit: {
                 "*": "deny",
@@ -261,11 +255,10 @@ export const layer = Layer.effect(
             mode: "primary",
             native: true,
           },
-          // Orchestrator mode is experimental and opt-in (default OFF): only
-          // registered when MIMOCODE_EXPERIMENTAL_ORCHESTRATOR is set. Gating the
-          // registration here removes it from the TUI mode-cycle, the agent
-          // dialog, defaultAgent, and prevents any `session`-tool peer spawns —
-          // making the rest of the orchestrator feature dead code when off.
+          // Orchestrator（编排者）模式是实验性的、需显式开启（默认关闭）：仅当设置了
+          // MIMOCODE_EXPERIMENTAL_ORCHESTRATOR 时才注册。在这里做注册门禁，会让它从 TUI
+          // 的模式循环、agent 选择弹窗、defaultAgent 中消失，并阻止任何 `session` 工具的
+          // 同级派生——从而在关闭时，orchestrator 功能的其余部分都成为不会执行的死代码。
           ...(Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR
             ? {
                 orchestrator: {
@@ -391,27 +384,25 @@ export const layer = Layer.effect(
             options: {},
             native: true,
             hidden: true,
-            // No `prompt` field — fork agent contract: at spawn time,
-            // tryStartCheckpointWriter captures parent's full LLM request prefix
-            // (system + tools + messages-to-watermark) into a frozen ForkContext,
-            // stored in Actor service's in-memory map. fork's runLoop reads from
-            // that snapshot instead of recomputing from this agent's identity.
-            // See docs/superpowers/specs/2026-05-26-fork-agent-prefix-cache-design.md
+            // 没有 `prompt` 字段 —— fork（分叉）agent 的约定：在派生时，
+            // tryStartCheckpointWriter 会把父级完整的 LLM 请求前缀
+            //（system + tools + 到 watermark 为止的消息）捕获进一个冻结的 ForkContext，
+            // 存放在 Actor 服务的内存映射里。fork 的 runLoop 从这份快照读取，
+            // 而不是根据本 agent 的身份重新计算。
+            // 详见 docs/superpowers/specs/2026-05-26-fork-agent-prefix-cache-design.md
             //
-            // No `toolAllowlist` field — fork agents must mirror parent's tool
-            // schema for prefix-cache alignment. Runtime tool restriction is
-            // enforced via actor.tools whitelist (set in tryStartCheckpointWriter).
-            // Permission inherits `defaults` (+ user) only — NO bespoke block.
-            // At runtime the fork's LLM-visible tool schema is filtered against the
-            // PARENT agent's permission (ForkContext.parentPermission, fed to
-            // handle.process in prompt.ts's fork branch), so it matches the parent
-            // (prompt-cache parity). NOTE: the per-call ctx.ask still evaluates this
-            // agent's own permission, but that is bounded by the actor.tools whitelist
-            // (set in tryStartCheckpointWriter) and memory-path-guard — the real write
-            // authority — so inheriting `defaults` over-grants nothing in practice.
-            // Memory writes skip the edit ask (askEditUnlessMemory), and any
-            // un-answerable ask fails clean (SYSTEM_SPAWNED_AGENT_TYPES →
-            // interactive:false). See
+            // 没有 `toolAllowlist` 字段 —— fork agent 必须与父级的工具 schema 保持一致，
+            // 以对齐 prefix 缓存。运行时的工具限制通过 actor.tools 白名单来强制执行
+            //（在 tryStartCheckpointWriter 中设置）。
+            // 权限只继承 `defaults`(+ user) —— 没有专门定制的规则块。
+            // 运行时，fork 对 LLM 可见的工具 schema 会按"父 agent"的权限过滤
+            //（ForkContext.parentPermission，在 prompt.ts 的 fork 分支喂给 handle.process），
+            // 因此与父级一致（保证 prompt 缓存对齐）。注意：每次调用的 ctx.ask 仍会求值
+            // 本 agent 自己的权限，但它已被 actor.tools 白名单（在 tryStartCheckpointWriter
+            // 中设置）和 memory 路径守卫——真正的写入权限来源——所限制，所以继承 `defaults`
+            // 在实际中并不会多授予任何权限。
+            // memory 写入会跳过 edit 询问（askEditUnlessMemory），任何无法回答的询问都会
+            // 干净地失败（SYSTEM_SPAWNED_AGENT_TYPES → interactive:false）。详见
             // docs/superpowers/specs/2026-06-05-checkpoint-writer-permission-deadlock-design.md
             permission: Permission.merge(defaults, user),
           },
@@ -510,7 +501,7 @@ export const layer = Layer.effect(
           item.permission = Permission.merge(item.permission, Permission.fromConfig(value.permission ?? {}))
         }
 
-        // Ensure Truncate.GLOB and skill directories are allowed unless explicitly configured
+        // 确保 Truncate.GLOB 和各技能目录默认被允许（除非已被显式配置为 deny）
         for (const name in agents) {
           const agent = agents[name]
           const globs = whitelistedDirs.filter(
@@ -608,7 +599,7 @@ export const layer = Layer.effect(
         yield* plugin.trigger("experimental.chat.system.transform", { model: resolved }, { system })
         const existing = yield* InstanceState.useEffect(state, (s) => s.list())
 
-        // TODO: clean this up so provider specific logic doesnt bleed over
+        // TODO: 清理一下这里，避免特定 provider 的逻辑渗透进来
         const authInfo = yield* auth.get(model.providerID).pipe(Effect.orDie)
         const isOpenaiOauth = model.providerID === "openai" && authInfo?.type === "oauth"
 
