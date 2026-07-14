@@ -372,27 +372,51 @@ export const layer = Layer.effect(
       yield* state.cancel(sessionID)
     })
 
+    // ============================================================================
+    // resolvePromptParts:处理用户输入里的 `@` 引用。
+    //
+    // 例:用户输入 "看下 @src/app.ts,再让 @explore 去调研"
+    //   → 输出 [
+    //       { type: "text", text: "看下 @src/app.ts,再让 @explore 去调研" }, // 原话
+    //       { type: "file", url: ".../src/app.ts" },  // @src/app.ts 是个文件
+    //       { type: "agent", name: "explore" },        // @explore 是个 agent
+    //     ]
+    //
+    // 它只负责"认出每个 @xxx 是文件还是 agent",不会去读文件内容(读内容是后面
+    // createUserMessage 那步做的)。斜杠命令、shell 输入都会先过这个函数。
+    // ============================================================================
     const resolvePromptParts = Effect.fn("SessionPrompt.resolvePromptParts")(function* (template: string) {
       const ctx = yield* InstanceState.context
+      // 先把用户原话原样存进去当第一项。@xxx 不会被删掉,后面认出来的文件/agent
+      // 是"额外加"在后面,不是替换掉原文。
       const parts: PromptInput["parts"] = [{ type: "text", text: template }]
+      // 用正则把文本里所有 `@xxx` 找出来(match[1] 就是 @ 后面那串,比如 "src/app.ts")。
       const files = ConfigMarkdown.files(template)
-      const seen = new Set<string>()
+      const seen = new Set<string>() // 记下处理过的,同一个 @foo 出现两次也只处理一次
+      // 把所有 @xxx 同时(并发)处理。这里不关心每次的返回值,直接往上面的 parts 里塞。
       yield* Effect.forEach(
         files,
         Effect.fnUntraced(function* (match) {
           const name = match[1]
           if (seen.has(name)) return
           seen.add(name)
+          // 把 @ 后面的名字拼成完整路径:`~/` 开头就是用户主目录下,否则就是项目目录下。
           const filepath = name.startsWith("~/")
             ? path.join(os.homedir(), name.slice(2))
             : path.resolve(ctx.worktree, name)
 
+          // 看看这个路径在磁盘上到底存不存在。存在就拿到文件信息,不存在就是空。
           const info = yield* fsys.stat(filepath).pipe(Effect.option)
           if (Option.isNone(info)) {
+            // 找不到这个文件 → 那 @name 可能是个 agent 名(比如 @explore、@plan)。
+            // 是 agent 就记下来;两者都不是就不管它,@name 就当普通文字留在原话里。
             const found = yield* agents.get(name)
             if (found) parts.push({ type: "agent", name: found.name })
             return
           }
+          // 文件确实存在 → 记一条文件引用(只记路径和类型,不读里面的内容)。
+          // 用 mime 区分它是文件夹还是普通文件。
+          // 注意:先查文件、再查 agent,所以万一有同名文件,会被当成文件。
           const stat = info.value
           parts.push({
             type: "file",
@@ -406,74 +430,112 @@ export const layer = Layer.effect(
       return parts
     })
 
+    // ============================================================================
+    // title:给对话自动起标题(就像 ChatGPT 左侧列表里那个自动生成的对话名)。
+    // 用户发完第一条消息后,后台偷偷调一个便宜的小模型,根据这句话概括出一个标题。
+    // 全程静默运行、不阻塞主流程,失败了也只记日志不影响使用(所以是"锦上添花"功能)。
+    // ============================================================================
     const title = Effect.fn("SessionPrompt.ensureTitle")(function* (input: {
       session: Session.Info
       history: MessageV2.WithParts[]
       providerID: ProviderID
       modelID: ModelID
     }) {
+      // --- 一堆守卫:只在"该起标题"的时候才干活,否则直接返回 ---
+      // 是子会话(被派生出来的小弟,用户看不到)→ 不用起标题
       if (input.session.parentID) return
+      // 标题已经不是默认值了(用户改过 / 之前已生成过)→ 别覆盖
       if (!Session.isDefaultTitle(input.session.title)) return
 
+      // real:判断"是不是一条真人发的用户消息"。排除掉系统自动塞进去的合成消息(synthetic)。
       const real = (m: MessageV2.WithParts) =>
         m.info.role === "user" && !m.parts.every((p) => "synthetic" in p && p.synthetic)
       const idx = input.history.findIndex(real)
-      if (idx === -1) return
+      if (idx === -1) return // 压根没有真人消息 → 不起
+      // 只在"恰好只有第一条真人消息"时起标题,保证整个对话只在开头生成这一次、不重复生成。
       if (input.history.filter(real).length !== 1) return
 
+      // 截取"从头到第一条真人消息"这段作为生成标题的上下文。
       const context = input.history.slice(0, idx + 1)
       const firstUser = context[idx]
-      if (!firstUser || firstUser.info.role !== "user") return
+      if (!firstUser || firstUser.info.role !== "user") return // 顺便帮 TS 确认类型
       const firstInfo = firstUser.info
 
+      // 特殊情况:第一条消息可能全是"子任务"(派活给子 agent)而不是文字,
+      // onlySubtasks 标记这种情况,后面取内容的方式不一样。
       const subtasks = firstUser.parts.filter((p): p is MessageV2.SubtaskPart => p.type === "subtask")
       const onlySubtasks = subtasks.length > 0 && firstUser.parts.every((p) => p.type === "subtask")
 
+      // 取专门用来起标题的 agent 配置。
       const ag = yield* agents.get("title")
       if (!ag) return
+      // 挑一个模型来干活,从上往下多级 fallback(等价于 a ?? b ?? c ?? d):
+      // agent 指定的模型组 → agent 写死的模型 → 这个 provider 的小模型 → 当前对话用的模型。
+      // 优先小模型,因为起标题很简单,用便宜快的就够了,省钱。
       const mdl = ag.modelRef
         ? yield* provider.resolveModelRef(ag.modelRef, input.providerID)
         : ag.model
           ? yield* provider.getModel(ag.model.providerID, ag.model.modelID)
           : ((yield* provider.getSmallModel(input.providerID)) ??
             (yield* provider.getModel(input.providerID, input.modelID)))
+      // 拼出"喂给模型的消息":全是子任务就把各子任务的 prompt 拼起来;否则把上下文转成模型能吃的格式。
       const msgs = onlySubtasks
         ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
         : yield* MessageV2.toModelMessagesEffect(context, mdl)
+      // 流式调模型(像前端 SSE,一个字一个字吐),后面 .pipe(...) 是流处理管道:
       const text = yield* llm
         .stream({
           agent: ag,
           user: firstInfo,
           system: [],
-          small: true,
-          tools: {},
+          small: true, // 标记为小任务
+          tools: {}, // 不给工具,起标题不需要
           model: mdl,
           sessionID: input.session.id,
-          retries: 2,
+          retries: 2, // 失败重试 2 次
           messages: [{ role: "user", content: "Generate a title for this conversation:\n" }, ...msgs],
         })
         .pipe(
-          Stream.filter((e): e is Extract<LLM.Event, { type: "text-delta" }> => e.type === "text-delta"),
-          Stream.map((e) => e.text),
-          Stream.mkString,
+          Stream.filter((e): e is Extract<LLM.Event, { type: "text-delta" }> => e.type === "text-delta"), // 只要正文,不要思考
+          Stream.map((e) => e.text), // 取出每段文字
+          Stream.mkString, // 把碎片拼成完整字符串(相当于 arr.join(""))
           Effect.orDie,
         )
+      // 清洗模型输出(模型返回不可信,得洗):
       const cleaned = text
-        .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-        .split("\n")
-        .map((line) => line.trim())
-        .find((line) => line.length > 0)
+        .replace(/<think>[\s\S]*?<\/think>\s*/g, "") // 去掉混进正文的 <think> 思考标签(对付把思考塞正文的模型)
+        .split("\n") // 按行拆
+        .map((line) => line.trim()) // 每行去空格
+        .find((line) => line.length > 0) // 取第一行非空的当标题
       if (!cleaned) return
+      // 太长就截断加省略号(超 100 字符切到 97 + "..."),防止列表标题溢出。
       const t = cleaned.length > 100 ? cleaned.substring(0, 97) + "..." : cleaned
+      // 存标题。万一存失败只记错误日志、不往上抛(标题只是辅助功能,失败无所谓)。
       yield* sessions
         .setTitle({ sessionID: input.session.id, title: t })
         .pipe(Effect.catchCause((cause) => elog.error("failed to generate title", { error: Cause.squash(cause) })))
     })
 
+    // ============================================================================
+    // predict:预测用户"下一句最可能想说什么",给一个输入建议(类似输入法联想 / Copilot
+    // 的灰色预填提示)。
+    //
+    // ⭐ 关键特征——【旁路调用(bypass)】:它裸调 AI SDK 底层的 generateText,刻意*绕过*
+    // 系统封装的 llm.stream 正规通道。因为预测是个"影子请求",不该污染真实对话记录
+    // (trajectory),也不该触发与会话耦合的插件钩子。类比前端:正规 request() 带一堆拦截器
+    // (记日志/埋点/改历史),而影子请求宁可用底层 fetch 裸调来避开这些副作用。详见下方调用处。
+    //
+    // 跟 title 是兄弟函数(挑小模型、清洗输出、失败不影响主流程),但目的相反:
+    // title 看对话开头起标题,predict 看对话结尾猜下一句。
+    // 也是"锦上添花"功能,任何一步不满足就返回空串 ""。
+    // ============================================================================
     const predict = Effect.fn("SessionPrompt.predict")(function* (input: { sessionID: SessionID }) {
+      // 实验性功能,配置里可以关掉(feature flag)。关了就直接不预测。
       const cfg = yield* config.get()
       if (cfg.experimental?.predict_next_prompt === false) return ""
 
+      // real:同 title,只认真人发的用户消息(排除系统合成的)。
+      // 但这里用 findLastIndex 找"最后一条"真人消息——predict 关心的是"你刚说完啥"。
       const history = yield* sessions.messages({ sessionID: input.sessionID, agentID: "main" })
       const real = (m: MessageV2.WithParts) =>
         m.info.role === "user" && !m.parts.every((p) => "synthetic" in p && p.synthetic)
@@ -485,6 +547,9 @@ export const layer = Layer.effect(
       // 只有真正回答了这条用户消息的那个助手 turn 才算数。
       // 如果那个 turn 仍在运行中（其后跟着一个未完成的助手消息），就直接放弃，
       // 这样我们永远不会把最新的 prompt 和一个陈旧/更早的结果配对。
+      // 竞态保护:只有当你最后那句话"已经被完整答完"时才预测下一句。
+      // 若这轮还没开始答(没有助手消息)、或还在答(有未 completed 的助手消息),就放弃——
+      // 否则会拿一个陈旧/未完成的结果去猜,建议会驴唇不对马嘴。类似前端搜索联想的防抖。
       const assistants = history
         .slice(userIdx + 1)
         .filter((m): m is MessageV2.WithParts & { info: MessageV2.Assistant } => m.info.role === "assistant")
@@ -497,6 +562,7 @@ export const layer = Layer.effect(
       const recentUsers = history.filter(real).slice(-3)
       const contextMsgs = [...recentUsers, lastAssistant]
 
+      // 复用 "title" 那个 agent 和同样的多级 fallback 选小模型逻辑(猜下一句也是轻任务,用便宜的就行)。
       const base = yield* agents.get("title")
       if (!base) return ""
       const mdl = base.modelRef
@@ -509,6 +575,10 @@ export const layer = Layer.effect(
       // 旁路调用：绕过 llm.stream，使预测不进入会话轨迹，也不会触发与会话耦合的插件钩子
       //（chat.params、chat.headers、system.transform、memory instructions、
       // x-session-affinity）。仍会发布 Metrics.ModelCall，使预测成本体现在分析统计中。
+      // ⭐ 与 title 最大的区别:这里裸调 AI SDK 底层的 generateText,而不走系统封装的
+      // llm.stream。类比前端:正规的 request() 带一堆拦截器(记日志/埋点/改历史),但预测
+      // 是个"影子请求",不想触发那些副作用,于是直接用底层 fetch 裸调。不过 llm.stream 里
+      // 那些*必要*的处理(如 ProviderTransform.message 消息格式转换)得自己用中间件补回来。
       const msgs = yield* MessageV2.toModelMessagesEffect(contextMsgs, mdl, { stripMedia: true })
       const language = yield* provider.getLanguage(mdl)
       const wrapped = wrapLanguageModel({
@@ -572,14 +642,29 @@ export const layer = Layer.effect(
       return stripped.length > 120 ? stripped.substring(0, 117) + "..." : stripped
     })
 
+    // ============================================================================
+    // insertReminders:发给模型前的"最后加工车间"。根据当前情境,往对话里偷偷塞一些
+    // "系统提醒纸条"(带 synthetic:true 标记的文本 part,界面隐藏、但模型看得到),
+    // 引导模型的行为。
+    //
+    // 为什么要这么做:模型是"无状态"的——它不会自己记住"现在是 plan 模式不能改文件"
+    // "用户传了个 Excel 该用某技能"。这些情境规则每轮都得重新、按需塞给它。
+    // 类比前端的请求拦截器/AOP:在请求真正发出前,根据上下文往里注入额外内容。
+    //
+    // 这个函数其实是 4 段互不相关的"要不要塞纸条"判断堆在一起:
+    //   ① compose 模式  ② 附件文档→推荐技能  ③ 文本里提及多个技能  ④ plan 模式
+    // ============================================================================
     const insertReminders = Effect.fn("SessionPrompt.insertReminders")(function* (input: {
       messages: MessageV2.WithParts[]
       agent: Agent.Info
       session: Session.Info
     }) {
+      // 找到最后一条用户消息——纸条基本都往它身上贴。没有就直接原样返回。
       const userMessage = input.messages.findLast((msg) => msg.info.role === "user")
       if (!userMessage) return input.messages
 
+      // ── ① compose 模式:如果这个对话是 compose 模式,把 compose 的技能说明 +
+      //    "产物存哪个目录"的指引,塞到消息最前面(unshift=塞头,让模型优先看到)。──
       const composeModeMsg = input.messages.find(
         (msg) => msg.info.role === "user" && msg.info.agent === "compose",
       )
@@ -588,6 +673,12 @@ export const layer = Layer.effect(
         const ctx = yield* InstanceState.context
         const composeCfg = (yield* config.get()).compose
         const docsDir = ConfigCompose.resolveDocsDir(ctx.worktree, composeCfg)
+        // PROMPT_COMPOSE 主体从 prompt/compose.txt 加载（英文，此处不展开翻译），
+        // 里面有两个占位符会被下面替换掉：
+        //   {{compose_skills}}  → compose 模式可用技能的说明块
+        //   {{compose_docs_dir}} → 下面这句内联英文 prompt，中文对照翻译为：
+        //     "保存 compose 技能的产物：规格(specs)存到 `.../specs`、
+        //      计划(plans)存到 `.../plans`、报告(reports)存到 `.../reports`。"
         const text = PROMPT_COMPOSE
           .replace("{{compose_skills}}", composeModeBlock)
           .replace("{{compose_docs_dir}}", `Save compose skill outputs: specs in \`${path.join(docsDir, "specs")}\`, plans in \`${path.join(docsDir, "plans")}\`, reports in \`${path.join(docsDir, "reports")}\`.`)
@@ -602,17 +693,31 @@ export const layer = Layer.effect(
       }
 
       const assistantMessage = input.messages.findLast((msg) => msg.info.role === "assistant")
+      // ── ② 附件文档→推荐技能:如果用户消息里带了办公文档(Excel/Word/PPT 等),
+      //    查有没有对应的内置技能能处理它,有就塞张纸条:"用户传了文档,这几个技能可能有用"。
+      //    两个 Flag 是开关,可整体关掉这个行为。──
       if (!Flag.MIMOCODE_DISABLE_BUILTIN_SKILLS && !Flag.MIMOCODE_DISABLE_OFFICIAL_SKILLS) {
+        // 把用户消息里的文件附件挑出来(只要 file 类型,拿到它的 mime 和文件名)。
         const fileCandidates = userMessage.parts.flatMap((p) => {
           if (p.type !== "file") return []
           const filenameFromSource =
             p.source?.type === "file" && p.source.path ? path.basename(p.source.path) : undefined
           return [{ mime: p.mime, filename: p.filename ?? filenameFromSource }]
         })
+        // 根据文件类型匹配出相关技能;匹配到就把它们的 SKILL.md 路径列成一张清单塞进去。
         const skills = matchDocumentSkills(fileCandidates)
         if (skills.length > 0) {
           const root = builtinSkillRoot()
           const entries = skills.map((skill) => `- ${skill}: ${path.join(root, skill, "SKILL.md")}`).join("\n")
+          // 下面这段 <system-reminder> 是发给模型的英文 prompt，保持英文原样不动。
+          // 中文对照翻译如下（仅供阅读）：
+          // ─────────────────────────────────────────────────────────────
+          // 【系统提醒】
+          // 用户的消息里附带了办公文档文件。下列内置技能可能适用于生成、读取或转换这些文件。
+          // 当它契合当前任务时，建议你参考对应的 SKILL.md——在适用的情况下，
+          // 优先使用这些技能，而不是自己临时想办法：
+          // ${entries：每行一个「- 技能名: 该技能 SKILL.md 的路径」}
+          // ─────────────────────────────────────────────────────────────
           const part = yield* sessions.updatePart({
             id: PartID.ascending(),
             messageID: userMessage.info.id,
@@ -628,21 +733,29 @@ ${entries}
         }
       }
 
-      // 自由文本中显式提及多个 skill（"/foo ... /bar ..."）。这与 SessionPrompt.command
-      // 的单命令路径是分开的，后者已经自己包裹了 SKILL.md 内容。通过检查 userMessage.parts
-      // 是否已包含这样的块来防止重复包裹。
+      // ── ③ 文本里提及多个技能:用户在一句话里手打了多个 /技能名(如
+      //    "先用 /research 调研,再用 /summary 总结")。这里把这些技能的说明书(SKILL.md)
+      //    自动加载塞给模型;若提到 2 个以上,再额外教模型"怎么把多个技能配合起来用"。──
+
+      // 步骤0——去重保护:如果消息里已经有 <skill_content> 块了(说明走斜杠命令那条路已经
+      // 包过一次),整段跳过,别重复加载同一个技能。
       const alreadyWrapped = userMessage.parts.some(
         (p) => p.type === "text" && p.text.startsWith('<skill_content name="'),
       )
       if (!alreadyWrapped) {
         const availableSkills = yield* sys.available(input.agent)
         if (availableSkills.length > 0) {
+          // 步骤1——把用户消息的文本拼起来,并"净化":抠掉 ```代码块``` 和 `行内代码`。
+          // 目的:防止用户贴的代码里正好有个 "/research" 字符串被误当成技能引用。
           const bodyText = userMessage.parts
             .flatMap((p) => (p.type === "text" ? [p.text] : []))
             .join("\n")
           const stripped = bodyText
             .replace(/```[\s\S]*?```/g, " ")
             .replace(/`[^`\n]*`/g, " ")
+          // 步骤2——正则扫出真正的技能提及。
+          // 正则含义:前面是行首或空格 + 斜杠 + 技能名(字母开头);后面必须是非标识符字符或结尾,
+          // 保证完整匹配一个词。两个过滤:去重(seen) + 必须是真实存在的技能(availableSkills)。
           const mentioned: string[] = []
           const seen = new Set<string>()
           const mentionRe = /(?:^|\s)\/([A-Za-z][A-Za-z0-9_-]*)(?=[^A-Za-z0-9_-]|$)/g
@@ -655,12 +768,15 @@ ${entries}
           }
 
           if (mentioned.length > 0) {
+            // 步骤3——加载技能内容,但设上限:只自动加载前 3 个的完整说明书(每个 SKILL.md
+            // 可能几百上千 token,全塞会爆上下文/烧钱)。超过 3 个的(overflow)留给模型按需自取。
             const MAX_AUTOLOAD = 3
             const toLoad = mentioned.slice(0, MAX_AUTOLOAD)
             const overflow = mentioned.slice(MAX_AUTOLOAD)
             for (const name of toLoad) {
               const info = availableSkills.find((s) => s.name === name)
               if (!info) continue
+              // 用 <skill_content> 标签包裹内容(给模型划清边界,防内容串味)。
               const part = yield* sessions.updatePart({
                 id: PartID.ascending(),
                 messageID: userMessage.info.id,
@@ -672,6 +788,11 @@ ${entries}
               userMessage.parts.push(part)
             }
 
+            // 步骤4——提到 >=2 个技能时,额外塞一份"编排方法论"(1 个不需要编排)。
+            // 下面的 5 步 checklist 是把"专家怎么组合多个技能"的思路显式教给模型:
+            // 先读全文档再规划→判断技能间关系(流水线/并行/约束叠加)→定中间产物格式→
+            // 冲突时定优先级→先出工作流再执行。loadedHint/overflowHint 动态告诉模型
+            // 哪些已加载好、哪些(超 3 个的)要自己调 Skill 工具去取。
             if (mentioned.length >= 2) {
               const loadedHint = toLoad.length > 0
                 ? `SKILL.md for [${toLoad.join(", ")}] has been auto-loaded above.`
@@ -679,6 +800,29 @@ ${entries}
               const overflowHint = overflow.length > 0
                 ? `For [${overflow.join(", ")}], use the Skill tool to load them on demand.`
                 : ""
+              // 下面这段 <system-reminder> 是发给模型的英文 prompt，保持英文原样不动。
+              // 中文对照翻译如下（仅供阅读，勿把注释内容当作真正发送的文本）：
+              // ─────────────────────────────────────────────────────────────
+              // 【系统提醒】
+              // 用户在这条消息里显式引用了多个技能：${mentioned 里的技能名}。
+              // ${loadedHint：[已加载的技能] 的 SKILL.md 已在上方自动加载。}
+              // ${overflowHint：对于 [超出上限的技能]，请用 Skill 工具按需自行加载。}
+              //
+              // 动手之前，先完成一份"编排计划"：
+              //   1. 先把每一个被引用技能的 SKILL.md 完整读一遍，再做规划
+              //      （绝不能只凭技能的简短描述就规划——完整的 SKILL.md 里可能有约束，
+              //       会直接推翻你凭空想象出来的工作流）。
+              //   2. 判断这些技能之间的"组合关系"属于哪一种：
+              //        · 流水线 pipeline —— A 的产出作为 B 的输入
+              //        · 并行 parallel   —— 各自负责互不相干的一部分
+              //        · 约束叠加 overlay —— 一个技能干活，另一个只提供规则/标准
+              //   3. 若是流水线：为中间产物定义"接口契约"——即格式和文件路径。
+              //   4. 若两个技能在同一维度上都给了指示（输出格式 / 风格 / 流程），
+              //      要显式声明一条"冲突消解规则"：在哪个维度上以哪个技能为准。
+              //   5. 输出一份精简的工作流（阶段 → 用到的技能 → 产物），然后照它执行。
+              //
+              // 规划的详略要与任务复杂度匹配：简单的组合，两三句话就够了。
+              // ─────────────────────────────────────────────────────────────
               const part = yield* sessions.updatePart({
                 id: PartID.ascending(),
                 messageID: userMessage.info.id,
@@ -705,9 +849,20 @@ Keep planning proportional to task complexity: for simple combinations, two or t
         }
       }
 
+      // ── ④ plan 模式(计划模式:让 agent 先研究和设计、别急着改代码)。分两种情况: ──
+
+      // 情况A——"刚从 plan 切到执行":当前 agent 不是 plan,但上一条助手消息是 plan 产出的。
+      // 说明用户看完计划、切去执行了。若存在 plan 文件,塞张纸条:"有个计划文件,照着它去执行"。
       if (input.agent.name !== "plan" && assistantMessage?.info.agent === "plan") {
         const plan = Session.plan(input.session)
         if (!(yield* fsys.existsSafe(plan))) return input.messages
+        // 下面拼给模型的 prompt 保持英文原样不动。中文对照翻译如下（仅供阅读）：
+        // ─────────────────────────────────────────────────────────────
+        // ${BUILD_SWITCH}：从 prompt/build-switch.txt 加载的"从 plan 切到执行"引导语
+        //                （告诉模型：计划阶段已结束，现在开始动手执行）。
+        //
+        // 在 ${plan} 路径存在一个计划文件。你应当按照文件里定义的计划去执行。
+        // ─────────────────────────────────────────────────────────────
         const part = yield* sessions.updatePart({
           id: PartID.ascending(),
           messageID: userMessage.info.id,
@@ -720,11 +875,104 @@ Keep planning proportional to task complexity: for simple combinations, two or t
         return input.messages
       }
 
+      // 不在 plan 模式(且上面情况A也不成立)→ 无事可做,原样返回。
       if (input.agent.name !== "plan" || assistantMessage?.info.agent === "plan") return input.messages
 
+      // 情况B——"正处于 plan 模式":塞一大段行为约束纸条,把模型降级成"只读研究"状态:
+      // 只能读文件/搜索、只能写 plan 文件,禁止改其他文件、禁止跑 test/lint/build 等有副作用的命令。
+      // 类比前端的"只读模式/权限降级"。先确保 plan 文件所在目录存在。
       const plan = Session.plan(input.session)
       const exists = yield* fsys.existsSafe(plan)
       if (!exists) yield* fsys.ensureDir(path.dirname(plan)).pipe(Effect.catch(Effect.die))
+      // 下面这段 <system-reminder> 是发给模型的英文 prompt，保持英文原样不动。
+      // 中文对照翻译如下（仅供阅读，勿把注释内容当作真正发送的文本）：
+      // ═════════════════════════════════════════════════════════════════
+      // 【系统提醒】
+      // plan（计划）模式已激活。用户希望你先做调研和设计，暂时【不要】动手执行。
+      // 本条指令优先级高于你此前收到的任何其它指令。
+      //
+      // ## 你【应该】做什么（推荐）
+      // - 凡是专用只读工具能覆盖的，优先用它们：`read`（看文件）、`grep`（搜内容）、
+      //   `glob`（找文件），以及 `lsp` 系列工具（定义、引用、诊断）。这才是探索代码的正道。
+      // - 派生 `explore` / `general` 子 agent 来并行调研。
+      // - 只有当上述工具确实拿不到你要的信息时，才【可以】用 `bash` 来补这个缺口——
+      //   但仅限你确信是【纯只读、无任何副作用】的命令（例如 `git status`/`log`/`diff`、
+      //   列依赖）。不要用 `bash` 去干 `read`/`grep`/`glob` 已经能干的事。
+      //
+      // ## 你【绝对不能】做什么
+      // - 不要编辑或创建除下面那个 plan 文件之外的任何文件。对非 plan 文件的写入会被
+      //   直接拦截并失败——别尝试，也别让用户去审批。
+      // - 不要运行 `test`、`lint`、`typecheck`、`build` 或类似的项目命令。它们默认【不安全】：
+      //   `lint` 常配了 `--fix`，`test` 可能写快照或动数据库，`build` 会产出构建产物，
+      //   背后的脚本什么都干得出来。唯一的例外：你已经【明确核实过】——通过读取确切的
+      //   命令/配置——这一次具体调用没有副作用（没有 `--fix`/`--write`，不改文件/状态/数据库）。
+      //   若无法核实，就当它是被禁止的，改为把它记录到计划里。
+      // - 不要运行任何其它有副作用的 `bash`：不提交、不 `git push`、不装/卸包、
+      //   不写/移动/删除文件、不改配置、不 `change_directory`、不 `workflow`。
+      // - 如果你发现自己为了推进而想去改动某个东西，这正是一个信号——把它写进计划，
+      //   然后继续用只读方式调研。
+      //
+      // 请用好的判断力：自己去做只读操作，而不是把本可避免的确认弹窗甩给用户。
+      // 只有 plan 文件是可写的。
+      //
+      // ## 计划文件信息：
+      // ${exists ? "计划文件已存在于 ${plan}，你可以读取它并用 edit 工具做增量修改。"
+      //          : "还没有计划文件，你应当用 write 工具在 ${plan} 处创建你的计划。"}
+      // 你应当通过写入/编辑这个文件来逐步构建你的计划。注意：这是你唯一被允许编辑的文件，
+      // 除此之外你只能采取【只读】操作。
+      //
+      // ## 计划工作流
+      //
+      // ### 阶段 1：初步理解
+      // 目标：通过通读代码 + 向用户提问，全面理解用户的诉求。关键：本阶段你只能用 explore 这种子 agent。
+      //   1. 聚焦于理解用户诉求，以及与其诉求相关的代码。
+      //   2. 【并行启动至多 3 个 explore agent】（同一条消息里发多个工具调用）来高效探索代码库。
+      //      - 任务局限于已知文件、用户给了明确路径、或只做小范围定向改动时，用 1 个就够。
+      //      - 范围不确定、涉及代码库多处、或需要先摸清既有模式再规划时，才用多个。
+      //      - 重质不重量——最多 3 个，且应尽量用最少的数量（通常 1 个即可）。
+      //      - 若用多个：给每个 agent 指定明确的搜索焦点或探索区域。例如：一个查已有实现，
+      //        另一个探索相关组件，第三个调查测试模式。
+      //   3. 探索完代码后，用 question 工具就用户诉求中的模糊点提前向用户澄清。
+      //
+      // ### 阶段 2：设计
+      // 目标：设计一套实现方案。
+      // 基于用户意图和阶段 1 的探索结果，启动 general agent 来设计实现。最多并行 1 个。
+      //   【准则】
+      //   - 默认：大多数任务都至少启动 1 个 Plan agent——它有助于验证你的理解、权衡备选方案。
+      //   - 跳过 agent：仅限真正琐碎的任务（改错别字、单行改动、简单重命名）。
+      //   何时用多个 agent 的例子：任务涉及代码库多个部分 / 大型重构或架构变更 /
+      //   边界情况很多 / 你能从探索不同方案中获益。
+      //   按任务类型的视角举例：
+      //     - 新功能：简单性 vs 性能 vs 可维护性
+      //     - 修 bug：根因 vs 绕过 vs 预防
+      //     - 重构：最小改动 vs 干净架构
+      //   在给 agent 的 prompt 里：提供阶段 1 探索得到的完整背景（含文件名和代码路径追踪）；
+      //   描述需求与约束；要求它给出详细的实现计划。
+      //
+      // ### 阶段 3：评审
+      // 目标：评审阶段 2 的计划，确保与用户意图对齐。
+      //   1. 阅读 agent 指出的关键文件，加深理解。
+      //   2. 确保计划与用户最初的诉求一致。
+      //   3. 用 question 工具就剩余疑问向用户澄清。
+      //
+      // ### 阶段 4：最终计划
+      // 目标：把你的最终计划写进 plan 文件（你唯一能编辑的文件）。
+      //   - 只包含你推荐的方案，不要罗列所有备选。
+      //   - 确保计划文件既能快速扫读、又足够详细可执行。
+      //   - 包含将被修改的关键文件路径。
+      //   - 包含一个"验证"小节，描述如何端到端地测试改动（跑代码、用 MCP 工具、跑测试）。
+      //
+      // ### 阶段 5：调用 plan_exit 工具
+      // 在你这一轮的最末尾，一旦你已向用户提过问且对最终计划文件满意，就总是调用 plan_exit，
+      // 向用户表明你计划完毕。这至关重要——你这一轮的结束只能是两种情况之一：向用户提问，
+      // 或调用 plan_exit。除这两个理由外不要停下。
+      //
+      // 【重要】用 question 工具澄清需求/方案；用 plan_exit 请求对计划的批准。
+      // 不要用 question 工具去问"这个计划行不行？"——那是 plan_exit 干的事。
+      //
+      // 注意：这套工作流的任何时刻，你都可以随时向用户提问或澄清。不要对用户意图做大的假设。
+      // 目标是给用户呈上一份调研充分的计划，并在动手实现前把各种悬而未决的点收尾。
+      // ═════════════════════════════════════════════════════════════════
       const part = yield* sessions.updatePart({
         id: PartID.ascending(),
         messageID: userMessage.info.id,
