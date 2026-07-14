@@ -1780,13 +1780,25 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       } satisfies MessageV2.TextPart)
     })
 
+    // ============================================================================
+    // shellImpl：用户在 TUI 里直接敲 shell 命令(如 !git status)的执行体。
+    // 把"用户自己跑的命令 + 输出"也记录进对话历史,做成"assistant 消息 + bash 工具调用 +
+    // 结果"的记录,好让模型也能看到——相当于人和 AI 共享同一个终端。
+    // 套路同 handleSubtask:命令是用户敲的,不需模型决策,所以手动伪造出"模型若调用 bash
+    // 工具本该产生的记录",直接执行,再把结果填回去。
+    // 流程:①准备(会话/agent/model) → ②建信封+骨架 → ③选 shell 拼参数 →
+    //       ④启动子进程流式收集输出 → ⑤收尾(标记完成/中止)。
+    // ============================================================================
     const shellImpl = Effect.fn("SessionPrompt.shellImpl")(function* (input: ShellInput) {
+      // ── ①准备 ──
       const ctx = yield* InstanceState.context
       const run = yield* runner()
       const session = yield* sessions.get(input.sessionID)
+      // 若会话处于"待回退"状态,先清理掉(开始新命令前把上一轮的回退暂存收拾干净)。
       if (session.revert) {
         yield* revert.cleanup(session)
       }
+      // 校验 agent 存在;不存在就发错误事件(UI 弹 toast)并抛错。
       const agent = yield* agents.get(input.agent)
       if (!agent) {
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
@@ -1805,7 +1817,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             .resolveModelRef(agent.modelRef)
             .pipe(Effect.map((m) => ({ providerID: m.providerID, modelID: m.id })))
         : agent.model
+      // 模型多级 fallback:入参指定 → agent 指定 → 会话上次用的。
       const model = inputModel ?? agentModel ?? (yield* lastModel(input.sessionID))
+      // ── ②建"信封+骨架" ──
+      // 先建一条 user 消息(代表"用户发起了这次操作")。
       const userMsg: MessageV2.User = {
         id: input.messageID ?? MessageID.ascending(),
         sessionID: input.sessionID,
@@ -1815,6 +1830,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         model: { providerID: model.providerID, modelID: model.modelID },
       }
       yield* sessions.updateMessage(userMsg)
+      // 一条 synthetic 文本纸条(界面隐藏、模型可见):告诉模型"下面这个工具是用户自己执行的"。
       const userPart: MessageV2.Part = {
         type: "text",
         id: PartID.ascending(),
@@ -1825,6 +1841,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
       yield* sessions.updatePart(userPart)
 
+      // 再建一条 assistant 消息,作为承载 bash 工具调用的信封。
       const msg: MessageV2.Assistant = {
         id: MessageID.ascending(),
         sessionID: input.sessionID,
@@ -1841,6 +1858,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         providerID: model.providerID,
       }
       yield* sessions.updateMessage(msg)
+      // 建 bash 工具 part,初始 running。先写骨架,TUI 立刻能显示"⏳ 正在执行命令"(乐观更新)。
       const part: MessageV2.ToolPart = {
         type: "tool",
         id: PartID.ascending(),
@@ -1856,10 +1874,15 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
       yield* sessions.updatePart(part)
 
+      // ── ③选 shell + 拼调用参数 ──
+      // 取用户偏好的 shell,拿到它的名字(zsh/bash/fish/...)用于下面按 shell 分派参数。
       const sh = Shell.preferred()
       const shellName = (
         process.platform === "win32" ? path.win32.basename(sh, ".exe") : path.basename(sh)
       ).toLowerCase()
+      // 不同 shell 语法不同,用一张表按 shell 名分派各自的调用参数(策略模式)。
+      // zsh/bash 用 login shell(-l) + source rc 文件,是为了还原你平时终端的 alias/PATH/环境变量;
+      // eval + JSON.stringify(command) 把命令包成带引号的安全字符串,防特殊字符破坏 shell 语法。
       const invocations: Record<string, { args: string[] }> = {
         nu: { args: ["-c", input.command] },
         fish: { args: ["-c", input.command] },
@@ -1899,14 +1922,18 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         "": { args: ["-c", input.command] },
       }
 
+      // 按 shell 名取参数;不认识的 shell 用兜底("" 那项)。
       const args = (invocations[shellName] ?? invocations[""]).args
       const cwd = ctx.directory
+      // 触发插件钩子 shell.env,让插件有机会注入额外环境变量。
       const shellEnv = yield* plugin.trigger(
         "shell.env",
         { cwd, sessionID: input.sessionID, callID: part.callID },
         { env: {} },
       )
 
+      // 组装子进程:注入环境变量;TERM=dumb 让程序不输出颜色控制符(纯文本更干净);
+      // stdin=ignore 不接受输入;forceKillAfter 强杀前给 3 秒优雅退出。
       const cmd = ChildProcess.make(sh, args, {
         cwd,
         extendEnv: true,
@@ -1919,18 +1946,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         forceKillAfter: "3 seconds",
       })
 
-      let output = ""
-      let aborted = false
+      let output = ""        // 累积的命令输出
+      let aborted = false    // 是否被用户中止(见下方 onInterrupt)
 
+      // ── ⑤收尾(先定义,后面 ensuring 挂上去) ──
+      // uninterruptible:收尾本身不可被中断(写库写一半又被取消会导致状态烂掉)。
       const finish = Effect.uninterruptible(
         Effect.gen(function* () {
+          // 若被中止,在输出末尾追加一段"用户中止了命令"的元信息。
           if (aborted) {
             output += "\n\n" + ["<metadata>", "User aborted the command", "</metadata>"].join("\n")
           }
+          // 标记 assistant 消息完成(若还没标)。
           if (!msg.time.completed) {
             msg.time.completed = Date.now()
             yield* sessions.updateMessage(msg)
           }
+          // 把 bash 工具 part 从 running 定稿为 completed,写入最终输出。
           if (part.state.status === "running") {
             part.state = {
               status: "completed",
@@ -1945,8 +1977,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         }),
       )
 
+      // ── ④启动子进程,流式收集输出 ──
       const exit = yield* Effect.gen(function* () {
         const handle = yield* spawner.spawn(cmd)
+        // 子进程的 stdout/stderr 是流(handle.all):每来一块 chunk 就累积,并"非阻塞地"(run.fork)
+        // 刷新工具 part,使 TUI 像真实终端一样一行行往外冒(类比前端消费 SSE/ReadableStream)。
         yield* Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
           Effect.sync(() => {
             output += chunk
@@ -1956,19 +1991,21 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             }
           }),
         )
-        yield* handle.exitCode
+        yield* handle.exitCode  // 等进程退出码
       }).pipe(
         Effect.scoped,
+        // 被取消时只做一件轻量事:置 aborted=true。真正的收尾交给下面 ensuring 的 finish。
         Effect.onInterrupt(() =>
           Effect.sync(() => {
             aborted = true
           }),
         ),
         Effect.orDie,
-        Effect.ensuring(finish),
-        Effect.exit,
+        Effect.ensuring(finish),  // ≈ try/finally 的 finally:无论成功/失败/取消,都跑 finish
+        Effect.exit,              // 把结果包成 Exit,不直接抛,便于下面判断
       )
 
+      // 只有"非取消"的真实失败才往上抛;纯取消(用户主动 Esc)视为正常收尾,不算错误。
       if (Exit.isFailure(exit) && !Cause.hasInterruptsOnly(exit.cause)) {
         return yield* Effect.failCause(exit.cause)
       }
