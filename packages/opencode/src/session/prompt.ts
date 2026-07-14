@@ -1067,6 +1067,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return input.messages
     })
 
+    // ============================================================================
+    // resolveTools：把"工具定义"装配成大模型 SDK(AI SDK)能识别、能调用的工具对象。
+    //
+    // 输入：一个 agent + 一个 model + 当前会话；输出：{ 工具名: AITool } 字典，最终发给模型。
+    // 每个 AITool 里封了两样东西：
+    //   · inputSchema —— 现在就算好、随请求发给模型的参数 schema(模型据此决定怎么调)
+    //   · execute     —— 一个闭包,模型将来决定调用时 AI SDK 才回调它,里面套满了
+    //                    "白名单→前置钩子→真正执行→后置钩子→埋点"这条中间件洋葱。
+    //
+    // 类比前端:很像 tRPC/GraphQL 的 resolver 装配层——把业务函数包装成带 schema、
+    // 带鉴权中间件、带日志的可调用端点。
+    //
+    // 函数结构:
+    //   ① 准备阶段:算出本次调用的"规矩"(whitelist / askRouting / rejectionFor / context)
+    //   ② 循环A:包装原生工具(read/edit/bash/grep…)
+    //   ③ 循环B:包装 MCP 工具(外部 MCP server 提供的)
+    // ============================================================================
     const resolveTools = Effect.fn("SessionPrompt.resolveTools")(function* (input: {
       agent: Agent.Info
       model: Provider.Model
@@ -1078,10 +1095,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       agentID?: string
       task_id?: string
     }) {
-      using _ = log.time("resolveTools")
-      const tools: Record<string, AITool> = {}
-      const run = yield* runner()
-      const promptOps = yield* ops()
+      using _ = log.time("resolveTools") // 记录本函数耗时(块结束自动结算,using 是显式资源管理)
+      const tools: Record<string, AITool> = {} // 最终产物:工具字典,边装配边往里塞
+      const run = yield* runner() // Effect→Promise 的桥:AI SDK 的 execute 要 Promise,而我们逻辑写在 Effect 里
+      const promptOps = yield* ops() // 暴露给工具用的能力(prompt/cancel 等),放进每个工具的 ctx.extra
 
       // 按工具的运行时白名单：当 LLM 调用是代表一个已注册的 actor（子 agent 或对等 agent）
       // 发起时，查找该 actor 记录；如果 `actor.tools` 是数组，则拒绝调用不在白名单里的工具。
@@ -1118,8 +1135,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         agentName: input.agent.name,
         orchestratorEnabled: Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR,
       })
-      const askInteractive = askRouting.interactive
-      const askForward = askRouting.forward
+      const askInteractive = askRouting.interactive // 权限询问:是否弹窗问真人
+      const askForward = askRouting.forward // 权限询问:是否转发给上级审批
+      // rejectionFor:被白名单拦下时返回的统一"拒绝"输出(附上允许的工具清单,便于排查)。
       const rejectionFor = (toolID: string) => ({
         title: "Tool not permitted",
         output: `The "${toolID}" tool is not in this actor's whitelist. Allowed tools: ${
@@ -1128,6 +1146,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         metadata: { rejected: true, reason: "tool-whitelist" as const },
       })
 
+      // context:工厂函数,每次工具执行时用当次的 args/options 造一个新的 Tool.Context 注入进去。
+      // 类比后端框架里每个请求 new 一个 RequestContext。工具通过它拿到会话信息 + 两个关键回调:
+      //   · metadata(val) —— 工具执行中回传进度/标题给 UI(如 bash 边跑边刷输出)
+      //   · ask(req)      —— 工具要权限时调它(权限判定最终都汇聚到 Agent.runtimePermission)
+      // 工具本身不知道"怎么更新UI/怎么问权限",这些实现被注入进来(依赖注入/控制反转)。
       const context = (args: any, options: ToolExecutionOptions): Tool.Context => ({
         sessionID: input.session.id,
         abort: options.abortSignal!,
@@ -1138,6 +1161,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         actorID: input.agentID,
         taskId: input.task_id,
         messages: input.messages,
+        // metadata:工具执行中回传"标题/进度"→更新对应 tool part 的状态(仅当它还在 running/pending)。
         metadata: (val) =>
           input.processor.updateToolCall(options.toolCallId, (match) => {
             if (!["running", "pending"].includes(match.state.status)) return match
@@ -1170,15 +1194,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             .pipe(Effect.orDie),
       })
 
+      // ── 循环A:包装原生工具 ──────────────────────────────────────────────
+      // registry.tools(...) 已按 agent/model 筛选并定制好描述(见 tool/registry.ts),
+      // 这里把每个"工具定义"包装成 AI SDK 的 tool({ inputSchema, execute })。
       for (const item of yield* registry.tools({
         modelID: ModelID.make(input.model.api.id),
         providerID: input.model.providerID,
         agent: input.agent,
       })) {
+        // Zod 参数 → JSON Schema → 按不同模型商适配。一份定义,三种用途(TS类型/运行时校验/给模型的schema)。
         const schema = ProviderTransform.schema(input.model, z.toJSONSchema(item.parameters))
         tools[item.id] = tool({
-          description: item.description,
-          inputSchema: jsonSchema(schema),
+          description: item.description, // 工具说明书(给模型看)
+          inputSchema: jsonSchema(schema), // 参数 schema(给模型看)——"现在"就发出去
+          // execute:闭包,模型"将来"决定调用此工具时 AI SDK 才回调。用 run.promise 把 Effect 转成 Promise。
           execute(args, options) {
             return run.promise(
               Effect.gen(function* () {
@@ -1189,7 +1218,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   callID,
                   sessionID: input.session.id,
                 })
-                const ctx = context(args, options)
+                const ctx = context(args, options) // 造本次执行的上下文
+                // 步骤1——白名单拦截:不在这个 actor 的工具白名单里 → 直接拒绝、落库、返回。
                 if (whitelist && !whitelist.has(item.id)) {
                   const output = rejectionFor(item.id)
                   log.debug("tool execute rejected", {
@@ -1200,12 +1230,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   yield* input.processor.completeToolCall(options.toolCallId, output)
                   return output
                 }
+                // 步骤2——前置插件钩子:插件可在此改参数(beforeOutput.args)或取消调用(cancel)。类比 axios 请求拦截器。
                 const beforeOutput: { args: any; cancel?: boolean; cancelReason?: string } = { args }
                 yield* plugin.trigger(
                   "tool.execute.before",
                   { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID },
                   beforeOutput,
                 )
+                // 若插件要求取消 → 记 cancelled 埋点、落库、返回,不执行工具。
                 if (beforeOutput.cancel) {
                   const cancelOutput = {
                     title: "Cancelled",
@@ -1225,6 +1257,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   yield* input.processor.completeToolCall(options.toolCallId, cancelOutput)
                   return cancelOutput
                 }
+                // 步骤3——★真正执行工具本体(用可能被插件改过的 beforeOutput.args)。
                 const result = yield* item.execute(beforeOutput.args, ctx)
                 log.debug("tool execute done", {
                   tool: item.id,
@@ -1232,6 +1265,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   durationMs: Date.now() - startTs,
                   ok: true,
                 })
+                // 给结果里的附件补齐身份字段(id/会话/消息),挂靠到当前消息上。
                 const output = {
                   ...result,
                   attachments: result.attachments?.map((attachment) => ({
@@ -1241,11 +1275,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     messageID: input.processor.message.id,
                   })),
                 }
+                // 步骤4——后置插件钩子:插件可后处理结果。类比 axios 响应拦截器。
                 yield* plugin.trigger(
                   "tool.execute.after",
                   { tool: item.id, sessionID: ctx.sessionID, callID: ctx.callID, args: beforeOutput.args },
                   output,
                 )
+                // 步骤5——自我进化:如果这次是 write/edit 改动了 .mimocode/tools|skills 下的
+                // 扩展定义文件,就热重载工具注册表,让新工具/技能立即生效。
                 if (
                   (item.id === "write" || item.id === "edit") &&
                   beforeOutput.args?.file_path &&
@@ -1253,6 +1290,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 ) {
                   yield* registry.reload().pipe(Effect.tapError((err) => Effect.sync(() => log.warn("extension reload failed", { error: err }))), Effect.ignore)
                 }
+                // 步骤6——发埋点:记录本次工具调用的耗时/输入输出字节数/状态(success)。
                 yield* bus
                   .publish(Metrics.ToolCall, {
                     sessionID: ctx.sessionID,
@@ -1263,6 +1301,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     tool_call_status: "success",
                   })
                   .pipe(Effect.ignore)
+                // 兜底:若执行完发现已被取消,主动落库结果,避免工具状态永远卡在 running(僵尸态)。
                 if (options.abortSignal?.aborted) {
                   yield* input.processor.completeToolCall(options.toolCallId, output)
                 }
@@ -1273,13 +1312,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         })
       }
 
+      // ── 循环B:包装 MCP 工具(外部 MCP server 提供的)──────────────────────
+      // 中间件结构与循环A几乎一样(白名单→前置钩子→执行→后置钩子→埋点),差异有二:
+      //   1. 权限统一走 ctx.ask(粒度粗,一律询问);
+      //   2. 返回是 result.content 数组,混着 text/image/resource,需要拆开处理。
       for (const [key, item] of Object.entries(yield* mcp.tools())) {
         const execute = item.execute
-        if (!execute) continue
+        if (!execute) continue // 没有执行体的(如纯提示型)跳过
 
+        // MCP 工具自带 schema,这里取出→按模型适配→写回,保证发给模型的 schema 格式正确。
         const schema = yield* Effect.promise(() => Promise.resolve(asSchema(item.inputSchema).jsonSchema))
         const transformed = ProviderTransform.schema(input.model, schema)
         item.inputSchema = jsonSchema(transformed)
+        // 覆写 execute:套上和循环A同款的中间件洋葱(原地改写 item.execute)。
         item.execute = (args, opts) =>
           run.promise(
             Effect.gen(function* () {
@@ -1291,6 +1336,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 sessionID: input.session.id,
               })
               const ctx = context(args, opts)
+              // 白名单拦截(MCP 版):不在白名单 → 拒绝(注意 MCP 的输出结构多一个 content 字段)。
               if (whitelist && !whitelist.has(key)) {
                 const rejection = rejectionFor(key)
                 const output = {
@@ -1314,6 +1360,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId },
                 mcpBeforeOutput,
               )
+              // 前置钩子要求取消 → 记 cancelled 埋点后直接返回,不执行 MCP 工具。
               if (mcpBeforeOutput.cancel) {
                 const cancelResult = {
                   content: [{ type: "text" as const, text: mcpBeforeOutput.cancelReason || "Tool call cancelled by hook" }],
@@ -1330,7 +1377,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   .pipe(Effect.ignore)
                 return cancelResult
               }
+              // MCP 工具统一走权限询问(粒度粗:patterns/always 都是 "*")。
               yield* ctx.ask({ permission: key, metadata: {}, patterns: ["*"], always: ["*"] })
+              // ★真正执行 MCP 工具(它是 Promise 接口,用 Effect.promise 包起来)。
               const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.promise(() =>
                 execute(mcpBeforeOutput.args, opts),
               )
@@ -1357,19 +1406,24 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   tool_call_status: "success",
                 })
                 .pipe(Effect.ignore)
+              // 拆分 MCP 返回的 content 数组:文本收集进 textParts,图片/二进制转成 data URL 附件。
+              // (模型上下文是文本通道,吃不下原始二进制,只能吃"编码后文本"或走附件通道。)
               const attachments: Omit<MessageV2.FilePart, "id" | "sessionID" | "messageID">[] = []
               for (const contentItem of result.content) {
-                if (contentItem.type === "text") textParts.push(contentItem.text)
+                if (contentItem.type === "text") textParts.push(contentItem.text) // 文本:直接收集
                 else if (contentItem.type === "image") {
+                  // 图片:base64 数据包成 data URL 附件(data:类型;base64,数据)。
                   attachments.push({
                     type: "file",
                     mime: contentItem.mimeType,
                     url: `data:${contentItem.mimeType};base64,${contentItem.data}`,
                   })
                 } else if (contentItem.type === "resource") {
+                  // 资源:分文本形态和二进制(blob)形态。
                   const { resource } = contentItem
-                  if (resource.text) textParts.push(resource.text)
+                  if (resource.text) textParts.push(resource.text) // 文本资源 → 收集
                   if (resource.blob) {
+                    // 二进制资源 → data URL 附件(blob 本身已是 base64;类型未知则兜底 octet-stream)。
                     attachments.push({
                       type: "file",
                       mime: resource.mimeType ?? "application/octet-stream",
@@ -1380,13 +1434,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 }
               }
 
+              // 防爆上下文:文本太长就截断(只留头尾预览),全文落盘到 outputPath,让模型需要时自己 read。
               const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
               const metadata = {
                 ...result.metadata,
                 truncated: truncated.truncated,
+                // 条件展开:只有截断了才加 outputPath 字段(false 展开等于不加)。
                 ...(truncated.truncated && { outputPath: truncated.outputPath }),
               }
 
+              // 组装最终输出:output=给模型看的正文(全文或预览);attachments 补齐身份;content 留原始结构备查。
               const output = {
                 title: "",
                 metadata,
@@ -1399,16 +1456,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 })),
                 content: result.content,
               }
+              // 兜底:被取消时主动落库,避免僵尸态(同循环A)。
               if (opts.abortSignal?.aborted) {
                 yield* input.processor.completeToolCall(opts.toolCallId, output)
               }
               return output
             }),
           )
-        tools[key] = item
+        tools[key] = item // 把包装好的 MCP 工具塞进字典
       }
 
-      return tools
+      return tools // 返回 { 工具名: AITool } 字典,交给 runLoop 发给模型
     })
 
     const handleSubtask = Effect.fn("SessionPrompt.handleSubtask")(function* (input: {
