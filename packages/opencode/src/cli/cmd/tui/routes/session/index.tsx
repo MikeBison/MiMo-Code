@@ -70,6 +70,7 @@ import { WorkflowTree } from "@tui/component/workflow-tree"
 import { SubagentFooter } from "./subagent-footer.tsx"
 import { DialogSubagent } from "./dialog-subagent.tsx"
 import { Flag } from "@/flag/flag"
+import { parseActorNotification } from "@/inbox/render"
 import { LANGUAGE_EXTENSIONS } from "@/lsp/language"
 import parsers from "../../../../../../parsers-config.ts"
 import * as Clipboard from "../../util/clipboard"
@@ -205,7 +206,7 @@ export function Session() {
     if (evt.type !== "scroll") return
     setScrolling(true)
     if (scrollHideTimer) clearTimeout(scrollHideTimer)
-    scrollHideTimer = setTimeout(() => setScrolling(false), 1000)
+    scrollHideTimer = setTimeout(() => setScrolling(false), 2500)
   }
   onCleanup(() => {
     if (scrollHideTimer) clearTimeout(scrollHideTimer)
@@ -281,6 +282,7 @@ export function Session() {
 
   let seeded = false
   let scroll: ScrollBoxRenderable
+  const scrollByAgent = new Map<string, number>()
   let prompt: PromptRef | undefined
   const bind = (r: PromptRef | undefined) => {
     prompt = r
@@ -342,10 +344,13 @@ export function Session() {
   })
 
   // Helper: Find next visible message boundary in direction
+  // Note: scroll.y is the scrollbox's layout Y, and child.y from getChildren()
+  // is in the same absolute coordinate space (includes scroll offset), so
+  // child.y - scroll.y gives a child's position relative to the viewport top.
   const findNextVisibleMessage = (direction: "next" | "prev"): string | null => {
     const children = scroll.getChildren()
     const messagesList = messages()
-    const scrollTop = scroll.y
+    const viewportTop = scroll.y
 
     // Get visible messages sorted by position, filtering for valid non-synthetic, non-ignored content
     // (a synthetic cron-origin text part is also visible — see the clock-row branch in UserMessage)
@@ -374,10 +379,10 @@ export function Session() {
 
     if (direction === "next") {
       // Find first message below current position
-      return visibleMessages.find((c) => c.y > scrollTop + 10)?.id ?? null
+      return visibleMessages.find((c) => c.y > viewportTop + 10)?.id ?? null
     }
     // Find last message above current position
-    return [...visibleMessages].reverse().find((c) => c.y < scrollTop - 10)?.id ?? null
+    return [...visibleMessages].reverse().find((c) => c.y < viewportTop - 10)?.id ?? null
   }
 
   // Helper: Scroll to message in direction or fallback to page scroll
@@ -586,21 +591,37 @@ export function Session() {
         name: "btw",
       },
       onSelect: async (dialog) => {
-        const question = await DialogPrompt.show(dialog, "/btw", {
-          placeholder: t("tui.command.session.ask.placeholder"),
-        })
-        if (!question || !question.trim()) return
-        const res = await sdk.client.session
-          .ask({ sessionID: route.sessionID, question: question.trim() })
-          .catch((error) => {
-            toast.show({
-              message: error instanceof Error ? error.message : "Failed to ask side question",
-              variant: "error",
-            })
-            return undefined
-          })
-        if (!res) return
-        await DialogAlert.show(dialog, "/btw", res.data?.answer ?? "(no answer)")
+        // Ask a read-only side question via fork-query. Keep the prompt dialog
+        // mounted in a busy/spinner state across the (multi-second) blocking
+        // `ask` so the user gets immediate feedback, then swap in the answer.
+        // READ-ONLY + EPHEMERAL: the answer is shown in a dismissible dialog and
+        // never injected into the conversation.
+        await DialogPrompt.ask(
+          dialog,
+          "/btw",
+          async (question, active) => {
+            const res = await sdk.client.session
+              .ask({ sessionID: route.sessionID, question })
+              .catch((error) => {
+                if (active())
+                  toast.show({
+                    message: error instanceof Error ? error.message : "Failed to ask side question",
+                    variant: "error",
+                  })
+                return undefined
+              })
+            if (!active()) return
+            if (!res) {
+              dialog.clear()
+              return
+            }
+            await DialogAlert.show(dialog, "/btw", res.data?.answer ?? "(no answer)")
+          },
+          {
+            placeholder: t("tui.command.session.ask.placeholder"),
+            busyText: t("tui.command.session.ask.busy"),
+          },
+        )
       },
     },
     {
@@ -1150,7 +1171,49 @@ export function Session() {
   })
 
   // snap to bottom when session changes
-  createEffect(on(() => route.sessionID, toBottom))
+  createEffect(on(() => route.sessionID, () => { scrollByAgent.clear(); toBottom() }))
+
+  // save/restore scroll position when switching between agent views
+  createEffect(
+    on(
+      () => currentAgentID(),
+      (agentID, prevAgentID) => {
+        if (!prevAgentID) return
+        if (scroll && !scroll.isDestroyed) {
+          // Determine whether the user was in "follow bottom" (sticky scroll) mode.
+          //
+          // A pixel-based check (`scrollTop >= scrollHeight - 1`) is racy here: the
+          // SolidJS effect fires after reactive renders that may have already grown
+          // scrollHeight (e.g. new streaming content, navigation chrome), but the
+          // framework's sticky-scroll adjustment (recalculateBarProps → applyStickyStart)
+          // hasn't run yet, leaving scrollTop momentarily behind scrollHeight.
+          //
+          // Instead, read opentui's internal `_hasManualScroll` flag — the authoritative
+          // "has the user scrolled away from the sticky edge" state. It's set true only
+          // on user-initiated scroll away from the sticky position, and reset false when
+          // the user scrolls back. This is immune to content-growth timing.
+          //
+          // If the field is absent (opentui internals changed), fall back to "at bottom"
+          // (safe direction — next visit will toBottom rather than restore a stale offset).
+          const hasManualScroll = (scroll as unknown as { _hasManualScroll?: boolean })._hasManualScroll
+          if (!hasManualScroll) scrollByAgent.delete(prevAgentID)
+          else scrollByAgent.set(prevAgentID, scroll.scrollTop)
+        }
+        const saved = scrollByAgent.get(agentID)
+        if (saved !== undefined) {
+          let tries = 0
+          const restore = () => {
+            if (!scroll || scroll.isDestroyed) return
+            scroll.scrollTo(Math.min(saved, scroll.scrollHeight))
+            if (++tries < 5 && scroll.scrollTop < saved - 1) setTimeout(restore, 60)
+          }
+          setTimeout(restore, 50)
+          return
+        }
+        toBottom()
+      },
+    ),
+  )
 
   return (
     <context.Provider
@@ -1410,6 +1473,18 @@ function UserMessage(props: {
     })[0]
   })
   const files = createMemo(() => props.parts.flatMap((x) => (x.type === "file" ? [x] : [])))
+  // Orchestrator actor-notifications arrive as a synthetic user text part whose
+  // text is the pre-rendered <actor-notification> wrapper (inbox/render.ts).
+  // Detect + parse it into a compact status card instead of showing raw XML.
+  // Gated on the orchestrator flag so non-orchestrator sessions are untouched.
+  const actorNotification = createMemo(() => {
+    if (!Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR) return undefined
+    return props.parts.flatMap((x) => {
+      if (x.type !== "text" || !x.synthetic) return []
+      const parsed = parseActorNotification(x.text)
+      return parsed ? [parsed] : []
+    })[0]
+  })
   const { theme } = useTheme()
   const [hover, setHover] = createSignal(false)
   const queued = createMemo(() => props.pending && props.message.id > props.pending)
@@ -1448,7 +1523,36 @@ function UserMessage(props: {
           )
         }}
       </Show>
-      <Show when={text()}>
+      <Show when={actorNotification()}>
+        {(note) => {
+          // Map each status to an icon + theme color. Mirrors the cronFire
+          // badge styling so orchestrator notifications read as first-class
+          // structured rows rather than raw <actor-notification> XML.
+          const style = createMemo(() => {
+            const s = note().status
+            if (s === "completed") return { icon: "✓", fg: theme.success, label: "completed" }
+            if (s === "failed") return { icon: "✗", fg: theme.error, label: "failed" }
+            if (s === "stalled") return { icon: "⏳", fg: theme.warning, label: "stalled" }
+            if (s === "ended") return { icon: "⊙", fg: theme.textMuted, label: "ended" }
+            return { icon: "⊜", fg: theme.textMuted, label: "cancelled" }
+          })
+          return (
+            <box id={props.message.id} marginTop={props.index === 0 ? 0 : 1} paddingLeft={2} flexDirection="row" gap={1}>
+              <text fg={theme.textMuted}>
+                <span style={{ bg: theme.backgroundElement, fg: style().fg, bold: true }}>
+                  {" "}
+                  {style().icon} sub-session {style().label}{" "}
+                </span>
+                <span style={{ fg: theme.text }}> {note().description}</span>
+                <Show when={note().summary}>
+                  <span style={{ fg: theme.textMuted }}> — {note().summary}</span>
+                </Show>
+              </text>
+            </box>
+          )
+        }}
+      </Show>
+      <Show when={text() && !actorNotification()}>
         <box
           id={props.message.id}
           border={["left"]}
@@ -1533,6 +1637,22 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
     return props.message.finish && props.message.finish !== "tool-calls"
   })
 
+  // The completion footer (▣ Agent · model · duration) must render exactly once
+  // per turn. A turn can produce several assistant messages: mid-loop ones finish
+  // with "tool-calls", the closing one finishes with "stop". In Orchestrator mode
+  // the turn characteristically ends on a "tool-calls" message (spawning
+  // subagents / handing off) that trails the final "stop" message — so `props.last`
+  // and `final()` land on two different messages and BOTH draw a footer (the stop
+  // one with a duration, the trailing tool-calls one without). Suppress the footer
+  // for a trailing message that already finished with "tool-calls"; still show it
+  // while a last message is streaming (finish undefined) or for the final/aborted
+  // message, which preserves non-orchestrator behavior.
+  const showFooter = createMemo(() => {
+    if (props.message.error?.name === "MessageAbortedError") return true
+    if (final()) return true
+    return props.last && props.message.finish !== "tool-calls"
+  })
+
   const duration = createMemo(() => {
     if (!final()) return 0
     if (!props.message.time.completed) return 0
@@ -1614,7 +1734,7 @@ function AssistantMessage(props: { message: AssistantMessage; parts: Part[]; las
         <ErrorBlock error={props.message.error!} />
       </Show>
       <Switch>
-        <Match when={props.last || final() || props.message.error?.name === "MessageAbortedError"}>
+        <Match when={showFooter()}>
           <box paddingLeft={3} flexDirection="row" justifyContent="space-between" marginTop={1}>
             <text>
               <span
@@ -1679,9 +1799,34 @@ const PART_MAPPING = {
 
 type MessageError = NonNullable<AssistantMessage["error"]>
 
+// Classify a terminal assistant error so the render layer can present it as a
+// structured, visually-distinct card (distinct label + color) rather than
+// dumping a raw provider blob into the transcript. A rate-limit gets its own
+// kind so the header reads "Rate limited" instead of a generic error. See T30.
+function errorKind(error: MessageError): "rate-limit" | "error" {
+  if (error.name === "APIError") {
+    const data = error.data as { statusCode?: number; responseBody?: string; message?: string }
+    if (
+      data.statusCode === 429 ||
+      SessionRetry.isRateLimitMessage(data.message ?? "") ||
+      (typeof data.responseBody === "string" && SessionRetry.isRateLimitMessage(data.responseBody))
+    ) {
+      return "rate-limit"
+    }
+  }
+  return "error"
+}
+
 function errorBody(error: MessageError): string {
   if (error.name === "MessageOutputLengthError") return "Output length limit reached"
-  return (error.data as { message?: string }).message ?? "Unknown error"
+  const message = (error.data as { message?: string }).message ?? "Unknown error"
+  // A 429 that reaches a TERMINAL assistant error (retries exhausted, or a shape
+  // retryable() didn't classify) would otherwise dump the raw provider blob here.
+  // Present a clean rate-limit message instead of leaking JSON/HTML. See T18/T30.
+  if (errorKind(error) === "rate-limit") {
+    return "The provider is rate limiting. Please wait a moment and try again."
+  }
+  return message
 }
 
 function errorMeta(error: MessageError): string | undefined {
@@ -1698,20 +1843,39 @@ function errorMeta(error: MessageError): string | undefined {
 
 function ErrorBlock(props: { error: MessageError }) {
   const { theme } = useTheme()
+  const kind = createMemo(() => errorKind(props.error))
+  const color = createMemo(() => (kind() === "rate-limit" ? theme.warning : theme.error))
+  const label = createMemo(() => (kind() === "rate-limit" ? "Rate limited" : "Error"))
   const meta = createMemo(() => errorMeta(props.error))
+  // Render as a structured, visually-distinct card (left border + panel bg),
+  // consistent with the workflow/permission cards, so a terminal error never
+  // looks like raw text pasted into the transcript. See T30.
   return (
-    <box flexDirection="column" paddingLeft={3} marginTop={1}>
-      <text fg={theme.error} wrapMode="word">
-        <span style={{ fg: theme.error }}>✗  </span>
-        {errorBody(props.error)}
-      </text>
-      <Show when={meta()}>
-        <box paddingLeft={3}>
-          <text fg={theme.textMuted} wrapMode="word">
-            {meta()}
-          </text>
-        </box>
-      </Show>
+    <box
+      flexDirection="column"
+      border={["left"]}
+      customBorderChars={SplitBorder.customBorderChars}
+      borderColor={color()}
+      backgroundColor={theme.backgroundPanel}
+      paddingTop={1}
+      paddingBottom={1}
+      paddingLeft={2}
+      marginTop={1}
+      gap={1}
+    >
+      <box flexDirection="row" gap={1} paddingLeft={3}>
+        <text fg={color()} attributes={TextAttributes.BOLD}>
+          ✗ {label()}
+        </text>
+        <Show when={meta()}>
+          <text fg={theme.textMuted}>· {meta()}</text>
+        </Show>
+      </box>
+      <box paddingLeft={3}>
+        <text fg={theme.text} wrapMode="word">
+          {errorBody(props.error)}
+        </text>
+      </box>
     </box>
   )
 }

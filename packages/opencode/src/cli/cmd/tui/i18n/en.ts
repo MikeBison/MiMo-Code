@@ -46,6 +46,8 @@ export const dict: Record<string, string> = {
   "tui.tips.shell_prefix":
     "Start a message with {highlight}!{/highlight} to run shell commands directly (e.g., {highlight}!ls -la{/highlight})",
   "tui.tips.tab_agent":
+    "Press {highlight}Tab{/highlight} or {highlight}Shift+Tab{/highlight} to cycle between Build, Plan, and Compose agents",
+  "tui.tips.tab_agent_orchestrator":
     "Press {highlight}Tab{/highlight} or {highlight}Shift+Tab{/highlight} to cycle between Build, Plan, Compose, and Orchestrator agents",
   "tui.tips.theme_mode":
     "Run {highlight}/dark{/highlight} for dark mode or {highlight}/light{/highlight} for light mode",
@@ -210,6 +212,7 @@ export const dict: Record<string, string> = {
   "tui.skill.html-to-video-pipeline.description": "Short-video magic — make short videos with HTML",
   "tui.skill.arxiv.description": "Search, cite, download, and track arXiv papers",
   "tui.skill.skill-creator.description": "Create, review, and improve agent skills",
+  "tui.skill.drive-mimo.description": "Programmatically drive another MiMoCode process — headless JSON events or interactive TUI via tmux",
   "tui.skill.research-paper-writing.description": "Draft, polish, and reviewer-style critique for academic papers",
   "tui.skill.design-blueprint.description":
     "Produce a design blueprint (DESIGN.md + Decision Trace) before mocking up any visual",
@@ -373,6 +376,7 @@ export const dict: Record<string, string> = {
   "tui.command.session.ask.title": "Ask a side question",
   "tui.command.session.ask.description": "Ask the current session a question without disrupting it",
   "tui.command.session.ask.placeholder": "Ask a side question…",
+  "tui.command.session.ask.busy": "Thinking…",
   "tui.command.session.unshare.title": "Unshare session",
   "tui.command.session.undo.title": "Undo previous message",
   "tui.command.session.redo.title": "Redo",

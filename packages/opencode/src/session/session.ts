@@ -27,6 +27,7 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider"
 import { Permission } from "@/permission"
+import { forwardRef } from "@/permission/permission-forward-ref"
 import { Global } from "@/global"
 import { ActorRegistry } from "@/actor/registry"
 import { Effect, Layer, Option, Context } from "effect"
@@ -543,6 +544,12 @@ export const layer: Layer.Layer<Service, never, Bus.Service | Storage.Service | 
         yield* Effect.sync(() => {
           SyncEvent.run(Event.Deleted, { sessionID, info: session }, { publish: hasInstance })
           SyncEvent.remove(sessionID)
+          // Drop this session's published parent-grant snapshot. ask() populates
+          // it process-wide on every call (before the needsAsk short-circuit), so
+          // without this the map grows one entry per session for the life of the
+          // process. Cleared here — the removal point — since a deleted session
+          // can no longer have background children that need to inherit from it.
+          forwardRef.clearParentGrants(sessionID)
         })
       } catch (e) {
         log.error(e)

@@ -43,6 +43,7 @@ export interface Interface {
   readonly environment: (model: Provider.Model, now: number) => Effect.Effect<string[]>
   readonly skills: (agent: Agent.Info) => Effect.Effect<string | undefined>
   readonly available: (agent?: Agent.Info) => Effect.Effect<Skill.Info[]>
+  readonly all: () => Effect.Effect<Skill.Info[]>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SystemPrompt") {}
@@ -125,6 +126,10 @@ export const layer = Layer.effect(
 
       available: Effect.fn("SystemPrompt.available")(function* (agent?: Agent.Info) {
         return yield* skill.available(agent)
+      }),
+
+      all: Effect.fn("SystemPrompt.all")(function* () {
+        return yield* skill.all()
       }),
     })
   }),

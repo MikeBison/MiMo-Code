@@ -50,6 +50,8 @@ export const dict = {
   "tui.tips.shell_prefix":
     "メッセージを {highlight}!{/highlight} で始めるとシェルコマンドを直接実行できます（例：{highlight}!ls -la{/highlight}）",
   "tui.tips.tab_agent":
+    "{highlight}Tab{/highlight} または {highlight}Shift+Tab{/highlight} で Build / Plan / Compose エージェントを切り替えます",
+  "tui.tips.tab_agent_orchestrator":
     "{highlight}Tab{/highlight} または {highlight}Shift+Tab{/highlight} で Build / Plan / Compose / Orchestrator エージェントを切り替えます",
   "tui.tips.theme_mode":
     "{highlight}/dark{/highlight} でダークモード、{highlight}/light{/highlight} でライトモードに切り替えます",
@@ -223,6 +225,7 @@ export const dict = {
   "tui.skill.html-to-video-pipeline.description": "ショート動画の神ツール - HTML でショート動画を制作",
   "tui.skill.arxiv.description": "arXiv 論文の検索・引用・ダウンロード・追跡",
   "tui.skill.skill-creator.description": "エージェントスキルの作成・レビュー・改善",
+  "tui.skill.drive-mimo.description": "別の MiMoCode プロセスをプログラムで操作——ヘッドレス JSON イベントまたは tmux 経由のインタラクティブ TUI",
   "tui.skill.research-paper-writing.description": "学術論文の執筆・推敲・査読者視点の批評",
   "tui.skill.design-blueprint.description": "モックアップ着手前に設計仕様（DESIGN.md + Decision Trace）を作成",
   "tui.skill.super-research.description": "自律型研究——実験ループ、調査、量的分析、ベンチマーク、根本原因調査、アブレーション、論文再現、論文執筆",
@@ -373,6 +376,7 @@ export const dict = {
   "tui.command.session.ask.title": "サイド質問をする",
   "tui.command.session.ask.description": "現在のセッションを中断せずに質問する",
   "tui.command.session.ask.placeholder": "サイド質問を入力…",
+  "tui.command.session.ask.busy": "考え中…",
   "tui.command.session.unshare.title": "共有を解除",
   "tui.command.session.undo.title": "直前のメッセージを取り消す",
   "tui.command.session.redo.title": "やり直し",

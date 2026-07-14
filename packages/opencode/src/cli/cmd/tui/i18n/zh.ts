@@ -49,6 +49,8 @@ export const dict = {
   "tui.tips.attach_file": "输入 {highlight}@{/highlight} 后接文件名以模糊搜索并附加文件",
   "tui.tips.shell_prefix": "以 {highlight}!{/highlight} 开头可直接运行 shell 命令（例如 {highlight}!ls -la{/highlight}）",
   "tui.tips.tab_agent":
+    "按 {highlight}Tab{/highlight} 或 {highlight}Shift+Tab{/highlight} 在 Build / Plan / Compose 智能体之间切换",
+  "tui.tips.tab_agent_orchestrator":
     "按 {highlight}Tab{/highlight} 或 {highlight}Shift+Tab{/highlight} 在 Build / Plan / Compose / Orchestrator 智能体之间切换",
   "tui.tips.theme_mode":
     "运行 {highlight}/dark{/highlight} 切换到深色模式，{highlight}/light{/highlight} 切换到浅色模式",
@@ -199,6 +201,7 @@ export const dict = {
   "tui.skill.html-to-video-pipeline.description": "短视频神器 - 利用 HTML 制作短视频",
   "tui.skill.arxiv.description": "搜索、引用、下载与追踪 arXiv 论文",
   "tui.skill.skill-creator.description": "创建、审查与改进 Agent 技能",
+  "tui.skill.drive-mimo.description": "以编程方式驱动另一个 MiMoCode 进程——无头 JSON 事件或通过 tmux 交互",
   "tui.skill.research-paper-writing.description": "撰写、润色学术论文，并以审稿人视角提前把关",
   "tui.skill.design-blueprint.description": "先出设计蓝图（DESIGN.md + 决策轨迹）再动手做视觉",
   "tui.skill.super-research.description": "自主研究——实验循环、主题调研、量化分析、对比评测、根因排查、消融实验、复现论文、写论文",
@@ -358,6 +361,7 @@ export const dict = {
   "tui.command.session.ask.title": "提一个旁问",
   "tui.command.session.ask.description": "向当前会话提问而不打断它",
   "tui.command.session.ask.placeholder": "提一个旁问…",
+  "tui.command.session.ask.busy": "思考中…",
   "tui.command.session.unshare.title": "取消分享",
   "tui.command.session.undo.title": "撤销上一条消息",
   "tui.command.session.redo.title": "重做",

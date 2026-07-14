@@ -2,6 +2,7 @@ import { createMemo, createSignal, For, onCleanup } from "solid-js"
 import { DEFAULT_THEMES, useTheme } from "@tui/context/theme"
 import { useLanguage } from "@tui/context/language"
 import { useLocal } from "@tui/context/local"
+import { Flag } from "@/flag/flag"
 
 const themeCount = Object.keys(DEFAULT_THEMES).length
 const TIP_ROTATION_MS = 10_000
@@ -16,6 +17,7 @@ const PRIORITY_WEIGHTS: Record<string, number> = {
   "tui.tips.login": 40,
   "tui.tips.theme_mode": 40,
   "tui.tips.tab_agent": 40,
+  "tui.tips.tab_agent_orchestrator": 40,
   "tui.tips.doc": 30,
   "tui.tips.models": 30,
   "tui.tips.connect": 30,
@@ -29,7 +31,6 @@ const TIP_KEYS = [
   "tui.tips.doc",
   "tui.tips.attach_file",
   "tui.tips.shell_prefix",
-  "tui.tips.tab_agent",
   "tui.tips.undo",
   "tui.tips.redo",
   "tui.tips.share",
@@ -128,6 +129,16 @@ const TIP_KEYS = [
   "tui.tips.rename",
 ] as const
 
+// Build the tip key pool. The Tab-cycle tip mentions the Orchestrator agent
+// only when the experiment is enabled; otherwise use the variant without it so
+// we never point users at an agent that isn't reachable. The platform-specific
+// suspend tip is always appended last.
+export function buildTipKeys(orchestratorEnabled: boolean, platform: NodeJS.Platform): readonly string[] {
+  const tabAgentKey = orchestratorEnabled ? "tui.tips.tab_agent_orchestrator" : "tui.tips.tab_agent"
+  const suspendKey = platform === "win32" ? "tui.tips.suspend.win" : "tui.tips.suspend.unix"
+  return [...TIP_KEYS, tabAgentKey, suspendKey]
+}
+
 type TipPart = { text: string; highlight: boolean }
 
 function parse(tip: string): TipPart[] {
@@ -169,8 +180,7 @@ export function Tips() {
   const theme = useTheme().theme
   const lang = useLanguage()
   const local = useLocal()
-  const platformSuspendKey = process.platform === "win32" ? "tui.tips.suspend.win" : "tui.tips.suspend.unix"
-  const allKeys = [...TIP_KEYS, platformSuspendKey] as readonly string[]
+  const allKeys = buildTipKeys(Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR, process.platform)
   const [key, setKey] = createSignal(pickWeighted(allKeys))
   const interval = setInterval(() => setKey(pickWeighted(allKeys)), TIP_ROTATION_MS)
   onCleanup(() => clearInterval(interval))

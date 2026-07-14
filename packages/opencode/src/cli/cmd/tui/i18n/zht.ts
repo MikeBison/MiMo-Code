@@ -49,6 +49,8 @@ export const dict = {
   "tui.tips.attach_file": "輸入 {highlight}@{/highlight} 後接檔案名稱以模糊搜尋並附加檔案",
   "tui.tips.shell_prefix": "以 {highlight}!{/highlight} 開頭可直接執行 shell 指令（例如 {highlight}!ls -la{/highlight}）",
   "tui.tips.tab_agent":
+    "按 {highlight}Tab{/highlight} 或 {highlight}Shift+Tab{/highlight} 在 Build / Plan / Compose 智慧代理之間切換",
+  "tui.tips.tab_agent_orchestrator":
     "按 {highlight}Tab{/highlight} 或 {highlight}Shift+Tab{/highlight} 在 Build / Plan / Compose / Orchestrator 智慧代理之間切換",
   "tui.tips.theme_mode":
     "執行 {highlight}/dark{/highlight} 切換深色模式，{highlight}/light{/highlight} 切換淺色模式",
@@ -199,6 +201,7 @@ export const dict = {
   "tui.skill.html-to-video-pipeline.description": "短影片神器 - 利用 HTML 製作短影片",
   "tui.skill.arxiv.description": "搜尋、引用、下載與追蹤 arXiv 論文",
   "tui.skill.skill-creator.description": "建立、審查與改進 Agent 技能",
+  "tui.skill.drive-mimo.description": "以程式化方式驅動另一個 MiMoCode 程序——無頭 JSON 事件或透過 tmux 互動",
   "tui.skill.research-paper-writing.description": "撰寫、潤色學術論文，並以審稿人視角提前把關",
   "tui.skill.design-blueprint.description": "先出設計藍圖（DESIGN.md + 決策軌跡）再動手做視覺",
   "tui.skill.super-research.description": "自主研究——實驗迴圈、主題調研、量化分析、對比評測、根因排查、消融實驗、複現論文、寫論文",
@@ -358,6 +361,7 @@ export const dict = {
   "tui.command.session.ask.title": "提一個旁問",
   "tui.command.session.ask.description": "向目前工作階段提問而不打斷它",
   "tui.command.session.ask.placeholder": "提一個旁問…",
+  "tui.command.session.ask.busy": "思考中…",
   "tui.command.session.unshare.title": "取消分享",
   "tui.command.session.undo.title": "復原上一條訊息",
   "tui.command.session.redo.title": "重做",

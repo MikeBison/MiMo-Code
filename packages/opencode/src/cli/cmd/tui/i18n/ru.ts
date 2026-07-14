@@ -51,6 +51,8 @@ export const dict = {
   "tui.tips.shell_prefix":
     "Начните сообщение с {highlight}!{/highlight}, чтобы выполнить shell-команду напрямую (например, {highlight}!ls -la{/highlight})",
   "tui.tips.tab_agent":
+    "Нажмите {highlight}Tab{/highlight} или {highlight}Shift+Tab{/highlight}, чтобы переключаться между агентами Build, Plan и Compose",
+  "tui.tips.tab_agent_orchestrator":
     "Нажмите {highlight}Tab{/highlight} или {highlight}Shift+Tab{/highlight}, чтобы переключаться между агентами Build, Plan, Compose и Orchestrator",
   "tui.tips.theme_mode":
     "Выполните {highlight}/dark{/highlight} для тёмного режима или {highlight}/light{/highlight} для светлого",
@@ -289,6 +291,7 @@ export const dict = {
   "tui.skill.html-to-video-pipeline.description": "Магический инструмент для коротких видео — создавайте короткие видео с помощью HTML",
   "tui.skill.arxiv.description": "Поиск, цитирование, загрузка и отслеживание статей arXiv",
   "tui.skill.skill-creator.description": "Создание, проверка и улучшение skills агента",
+  "tui.skill.drive-mimo.description": "Программное управление другим процессом MiMoCode — headless JSON-события или интерактивный TUI через tmux",
   "tui.skill.research-paper-writing.description": "Написание, полировка и рецензирование научных статей",
   "tui.skill.design-blueprint.description":
     "Создать проектную спецификацию (DESIGN.md + Decision Trace) до макетов",
@@ -444,6 +447,7 @@ export const dict = {
   "tui.command.session.ask.title": "Задать побочный вопрос",
   "tui.command.session.ask.description": "Задайте вопрос текущей сессии, не прерывая её",
   "tui.command.session.ask.placeholder": "Задайте побочный вопрос…",
+  "tui.command.session.ask.busy": "Думаю…",
   "tui.command.session.unshare.title": "Отменить публикацию",
   "tui.command.session.undo.title": "Отменить предыдущее сообщение",
   "tui.command.session.redo.title": "Повторить",

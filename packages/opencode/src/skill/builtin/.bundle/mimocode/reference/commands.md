@@ -41,6 +41,7 @@ Notable TUI flags: `--continue`/`-c` (resume last session), `--session`/`-s`, `-
 | `/voice` | Toggle streaming voice input (needs `sox`; MiMo-logged-in users) |
 | `/loop` | `[interval] <prompt>` — schedule a repeating prompt (also runs once now); maps the interval to a cron job |
 | `/loops` | List scheduled cron/loop jobs; `/loops cancel <id>` stops one |
+| `/rebuild` | Rebuild the conversation context now from the latest checkpoint — frees context on demand instead of waiting for the automatic overflow trigger. Keeps recent messages verbatim; earlier context collapses to the checkpoint summary. Waits (bounded) for an in-flight checkpoint writer first |
 | `/connect` | Sign in to a provider (e.g. OpenRouter) |
 | `/<skill-name>` | Invoke any available skill directly by name |
 

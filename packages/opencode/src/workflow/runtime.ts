@@ -9,6 +9,7 @@ import { Bus } from "@/bus"
 import { Inbox } from "@/inbox"
 import { Worktree } from "@/worktree"
 import { Provider } from "@/provider"
+import { Permission } from "@/permission"
 import { InstanceRef } from "@/effect/instance-ref"
 import { Instance } from "@/project/instance"
 import { Identifier } from "@/id/id"
@@ -206,6 +207,17 @@ interface StartInput {
    * result as its own tool output, so a parent inbox notification would surface a
    * DUPLICATE completion (and duplicate error text) on the next turn. */
   notifyOnTerminal?: boolean
+  /** Is a HUMAN attached to this launch who can answer a permission prompt? The
+   * up-front manifest permission ask uses this to decide `interactive`: a
+   * FOREGROUND launch (a real interactive session actor) prompts the human as
+   * before; a BACKGROUND/NON-INTERACTIVE launcher (a background subagent, a
+   * system actor) — or any NESTED workflow() sub-run (which has no launcher at
+   * all) — asks with `interactive: false` so the permission layer fails CLOSED
+   * (immediate DeniedError) instead of hanging forever on a reply that never
+   * comes. The workflow tool sets this from the launching actor's background
+   * flag; launch() forces it false for nested runs (depth > 0). Defaults to
+   * false (fail-closed) when the launcher can't be determined. */
+  interactive?: boolean
 }
 
 /** Options the guest may pass to `agent(prompt, opts?)`. */
@@ -223,6 +235,11 @@ interface AgentOpts {
   phase?: string
   /** Per-call override of the run's agentTimeoutMs (ms). */
   timeoutMs?: number
+  /** Opt-in bounded retry of a TRANSIENT failure (spawn-reject / timeout /
+   *  actor-error). Omitted → one attempt (today's behavior). `attempts` is the
+   *  TOTAL attempts including the first (min 1). Terminal reasons (over-cap,
+   *  no-deliverable) are never retried. */
+  retry?: { attempts?: number; baseMs?: number; maxMs?: number }
 }
 
 export interface Interface {
@@ -291,6 +308,10 @@ export const layer = Layer.effect(
     const inbox = yield* Inbox.Service
     const worktree = yield* Worktree.Service
     const provider = yield* Provider.Service
+    // Layer-scoped so its requirement is discharged here (like Config below) and
+    // does not leak into start/resume's effect signatures. Used by launch() to
+    // request a workflow's declared meta.permissions up front.
+    const permissionService = yield* Permission.Service
     // Resolve the Config service handle at layer scope (a legitimate layer dep,
     // satisfied by Config.defaultLayer) so the requirement is discharged here and
     // does NOT leak into start/resume's effect signatures. Only config.get() runs
@@ -623,6 +644,14 @@ export const layer = Layer.effect(
       // null. Pure observability — counters and the agent() return value are
       // unaffected. Wrapped in try/catch so a bus problem can never break a run.
       type FailReason = "over-cap" | "spawn-reject" | "timeout" | "actor-error" | "no-deliverable"
+      // Transient reasons worth re-attempting. Terminal reasons (over-cap =
+      // lifecycle exhausted; no-deliverable = the agent ran fine but produced
+      // nothing, which a re-run won't fix) are NOT retried.
+      const RETRYABLE_REASONS: ReadonlySet<FailReason> = new Set(["spawn-reject", "timeout", "actor-error"])
+      const backoffMs = (attempt: number, baseMs: number, maxMs: number) => {
+        const capped = Math.min(maxMs, baseMs * Math.pow(2, attempt))
+        return Math.floor(Math.random() * capped) // full jitter in [0, capped]
+      }
       const publishAgentFailed = (
         o: AgentOpts,
         reason: FailReason,
@@ -650,6 +679,56 @@ export const layer = Layer.effect(
 
       yield* bus.publish(WorkflowStarted, { sessionID: input.sessionID, runID, name })
 
+      // Up-front permission manifest: the workflow's agents run as background
+      // actors that cannot answer a permission prompt (their asks fail closed).
+      // So here — in the LAUNCH context — request each declared permission ONCE.
+      // On "always" the grant lands in the session ruleset (Permission.reply),
+      // and every background subagent sharing this sessionID inherits it (an allow
+      // rule short-circuits before their non-interactive auto-deny).
+      //
+      // CRITICAL — this ask must NOT hang. It is interactive (blocks for a human
+      // reply) ONLY when a human is actually attached to this launch. A FOREGROUND
+      // launch (interactive session actor) prompts as before. But a BACKGROUND /
+      // NON-INTERACTIVE launcher — a background subagent, a system actor — or any
+      // NESTED workflow() sub-run (depth > 0, spawned by a parent fiber with NO
+      // launcher at all) has no human to answer, so we force interactive:false.
+      // The permission layer then fails CLOSED (immediate DeniedError, no Deferred,
+      // provably cannot hang) exactly as subagent asks do. Effect.catchCause only
+      // rescues failure/denial — it does NOT rescue an indefinite block, so the
+      // interactive flag (not the catch) is what prevents the hang.
+      //
+      // Denial/rejection does NOT abort the run: the affected check just falls back
+      // or fails closed, per the workflow's own logic. Best-effort + never-throw so
+      // a manifest hiccup can't break launch.
+      const askInteractive = depth > 0 ? false : input.interactive === true
+      const declaredPermissions = parsed.ok ? parsed.meta.permissions : undefined
+      if (declaredPermissions && declaredPermissions.length) {
+        for (const decl of declaredPermissions) {
+          const patterns = decl.patterns && decl.patterns.length ? decl.patterns : decl.always ?? ["*"]
+          yield* permissionService
+            .ask({
+              sessionID: input.sessionID,
+              permission: decl.permission,
+              patterns,
+              always: decl.always ?? patterns,
+              interactive: askInteractive,
+              metadata: { workflow: name, ...(decl.reason ? { reason: decl.reason } : {}) },
+              ruleset: [],
+            })
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.sync(() => {
+                  log.info("workflow permission not granted up-front", {
+                    runID,
+                    permission: decl.permission,
+                    cause: String(cause),
+                  })
+                }),
+              ),
+            )
+        }
+      }
+
       // Observability-only spawn description from label/phase: "[Phase] label",
       // or just one of them, or undefined (then spawn falls back to agentType —
       // see spawn.ts `input.description ?? input.agentType`). label/phase NEVER
@@ -665,6 +744,11 @@ export const layer = Layer.effect(
       // subagents don't cross-contaminate. context:"none" keeps each worker free
       // of parent history (parallel fan-out is the use case). NEVER throw to the
       // guest for spawn/turn failures — resolve to null so the script continues.
+      // TEST SEAM: MIMOCODE_TEST_SPAWN_FAIL_ONCE=<n> makes the next <n> shared
+      // spawn attempts throw a synthetic spawn-reject (retryable), so a test can
+      // drive the engine retry path deterministically without depending on LLM /
+      // actor failure modes. No-op unless the env var is set. Run-scoped counter.
+      let testSpawnFailsLeft = Number(process.env.MIMOCODE_TEST_SPAWN_FAIL_ONCE ?? 0) || 0
       const spawnShared = async (
         actor: NonNullable<typeof spawnRef.current>,
         prompt: string,
@@ -691,6 +775,10 @@ export const layer = Layer.effect(
         const value = await bridge
           .promise(
             Effect.gen(function* () {
+              if (testSpawnFailsLeft > 0) {
+                testSpawnFailsLeft--
+                return yield* Effect.fail(new Error("test-forced spawn-reject"))
+              }
               const spawned = yield* actor.spawn({
                 mode: "subagent",
                 sessionID: input.sessionID,
@@ -756,7 +844,7 @@ export const layer = Layer.effect(
           publishAgentFailed(o, reason, { actorID, errorMessage })
         }
         scheduleFlush(entry)
-        return value
+        return { value, reason: value !== null ? null : reason }
       }
 
       // Isolated spawn: fresh worktree, file tools rebound to it via Instance.provide.
@@ -786,7 +874,7 @@ export const layer = Layer.effect(
           })
         if (!info) {
           publishAgentFailed(o, "spawn-reject", { errorMessage })
-          return null
+          return { value: null, reason: "spawn-reject" as FailReason }
         }
         // Register the worktree for cleanup the moment it exists on disk — BEFORE
         // the spawn attempt. If spawn rejects or the agent fails, cancel-cleanup
@@ -818,6 +906,10 @@ export const layer = Layer.effect(
             wtBridge
               .promise(
                 Effect.gen(function* () {
+                  if (testSpawnFailsLeft > 0) {
+                    testSpawnFailsLeft--
+                    return yield* Effect.fail(new Error("test-forced spawn-reject"))
+                  }
                   const s = yield* actor.spawn({
                     mode: "subagent",
                     sessionID: input.sessionID,
@@ -903,13 +995,14 @@ export const layer = Layer.effect(
         if (!keep) {
           await bridge.promise(worktree.remove({ directory: info.directory })).catch(() => undefined)
           entry.worktrees.delete(info.directory)
-          return succeeded ? value : null
+          return succeeded ? { value, reason: null } : { value: null, reason }
         }
         // keep: the worktree stays on disk and tracked until an integrate step or
         // cancel reclaims it; surface its branch so the script can act on it.
         const wt = { branch: info.branch, directory: info.directory, changed: true }
-        if (value && typeof value === "object" && !Array.isArray(value)) return { ...(value as object), _worktree: wt }
-        return { _worktree: wt, result: value }
+        if (value && typeof value === "object" && !Array.isArray(value))
+          return { value: { ...(value as object), _worktree: wt }, reason: null }
+        return { value: { _worktree: wt, result: value }, reason: null }
       }
 
       // Per-call start times (host wall-clock) for the observability nodes' durationMs.
@@ -967,20 +1060,38 @@ export const layer = Layer.effect(
             // happens AFTER the slot is released, so file IO never holds a slot.
             const result = await sem.run(async () =>
               globalSemLocal.run(async () => {
-                if (entry.agentCount >= lifecycleCap) {
-                  warnCapOnce()
-                  publishAgentFailed(o, "over-cap")
-                  return null
+                // NOTE: spawnShared counts running/succeeded/failed per ATTEMPT
+                // (each attempt is a real spawn). A call that succeeds on retry N
+                // therefore shows N-1 failed + 1 succeeded — intended: the live
+                // view reflects actual spawns, while the guest sees a single result.
+                const maxAttempts = Math.max(1, o.retry?.attempts ?? 1)
+                const baseMs = o.retry?.baseMs ?? 400
+                const maxMs = o.retry?.maxMs ?? 4000
+                let last: { value: unknown; reason: FailReason | null } = { value: null, reason: "actor-error" }
+                for (let attempt = 0; attempt < maxAttempts; attempt++) {
+                  if (entry.agentCount >= lifecycleCap) {
+                    warnCapOnce()
+                    publishAgentFailed(o, "over-cap")
+                    last = { value: null, reason: "over-cap" }
+                    break
+                  }
+                  entry.agentCount++
+                  const actor = spawnRef.current
+                  if (!actor) throw new Error("Actor service unavailable")
+                  // Resolve the guest's model ref host-side AFTER the journal key was
+                  // computed above (the key hashes the raw `o.model` ref, NOT the
+                  // resolved struct, so resume keys stay stable across config changes).
+                  // Never-throws: an unknown group falls back to input.model.
+                  const resolvedModel = await bridge.promise(resolveAgentModel(o.model, input.model, entry.warnedModelRefs))
+                  last = await spawnShared(actor, promptStr, o, resolvedModel, setActorID)
+                  if (last.value !== null) break // success
+                  if (!last.reason || !RETRYABLE_REASONS.has(last.reason)) break // terminal
+                  if (attempt + 1 < maxAttempts) {
+                    log.info("workflow agent retry", { runID, reason: last.reason, next: attempt + 2, of: maxAttempts })
+                    await new Promise((r) => setTimeout(r, backoffMs(attempt, baseMs, maxMs)))
+                  }
                 }
-                entry.agentCount++
-                const actor = spawnRef.current
-                if (!actor) throw new Error("Actor service unavailable")
-                // Resolve the guest's model ref host-side AFTER the journal key was
-                // computed above (the key hashes the raw `o.model` ref, NOT the
-                // resolved struct, so resume keys stay stable across config changes).
-                // Never-throws: an unknown group falls back to input.model.
-                const resolvedModel = await bridge.promise(resolveAgentModel(o.model, input.model, entry.warnedModelRefs))
-                return spawnShared(actor, promptStr, o, resolvedModel, setActorID)
+                return last.value
               }),
             )
             markAgentNode(result === null ? "failed" : "succeeded", result)
@@ -1001,21 +1112,36 @@ export const layer = Layer.effect(
         }
         return sem.run(async () =>
           globalSemLocal.run(async () => {
-            if (entry.agentCount >= lifecycleCap) {
-              warnCapOnce()
-              publishAgentFailed(o, "over-cap")
-              markAgentNode("failed")
-              return null
+            // Same bounded-retry contract as the shared path; each attempt makes a
+            // fresh worktree (spawnIsolated does this internally + tracks it for
+            // reclaim). markAgentNode flips once, on the final disposition.
+            const maxAttempts = Math.max(1, o.retry?.attempts ?? 1)
+            const baseMs = o.retry?.baseMs ?? 400
+            const maxMs = o.retry?.maxMs ?? 4000
+            let last: { value: unknown; reason: FailReason | null } = { value: null, reason: "actor-error" }
+            for (let attempt = 0; attempt < maxAttempts; attempt++) {
+              if (entry.agentCount >= lifecycleCap) {
+                warnCapOnce()
+                publishAgentFailed(o, "over-cap")
+                last = { value: null, reason: "over-cap" }
+                break
+              }
+              entry.agentCount++
+              const actor = spawnRef.current
+              if (!actor) throw new Error("Actor service unavailable")
+              // Resolve the guest's model ref host-side (isolated agents aren't
+              // journaled, so there's no key to keep stable here). Never-throws.
+              const resolvedModel = await bridge.promise(resolveAgentModel(o.model, input.model, entry.warnedModelRefs))
+              last = await spawnIsolated(actor, promptStr, o, resolvedModel, setActorID)
+              if (last.value !== null) break // success
+              if (!last.reason || !RETRYABLE_REASONS.has(last.reason)) break // terminal
+              if (attempt + 1 < maxAttempts) {
+                log.info("workflow isolated agent retry", { runID, reason: last.reason, next: attempt + 2, of: maxAttempts })
+                await new Promise((r) => setTimeout(r, backoffMs(attempt, baseMs, maxMs)))
+              }
             }
-            entry.agentCount++
-            const actor = spawnRef.current
-            if (!actor) throw new Error("Actor service unavailable")
-            // Resolve the guest's model ref host-side (isolated agents aren't
-            // journaled, so there's no key to keep stable here). Never-throws.
-            const resolvedModel = await bridge.promise(resolveAgentModel(o.model, input.model, entry.warnedModelRefs))
-            const value = await spawnIsolated(actor, promptStr, o, resolvedModel, setActorID)
-            markAgentNode(value === null ? "failed" : "succeeded", value)
-            return value
+            markAgentNode(last.value === null ? "failed" : "succeeded", last.value)
+            return last.value
           }),
         )
       }
@@ -1442,6 +1568,7 @@ export const defaultLayer = layer.pipe(
   Layer.provide(Worktree.defaultLayer),
   Layer.provide(Provider.defaultLayer),
   Layer.provide(Config.defaultLayer),
+  Layer.provide(Permission.defaultLayer),
 )
 
 export * as WorkflowRuntime from "./runtime"

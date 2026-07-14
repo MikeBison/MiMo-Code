@@ -8,7 +8,9 @@ import { Log } from "../util"
 import { SessionRevert } from "./revert"
 import * as Session from "./session"
 import { Agent } from "../agent/agent"
-import { decideAskRouting } from "@/agent/config"
+import { decideAskRouting, SYSTEM_SPAWNED_AGENT_TYPES } from "@/agent/config"
+import { renderActorNotification } from "@/inbox/render"
+import { parseReturnHeader } from "@/actor/return-header"
 import { Provider } from "../provider"
 import { ModelID, ProviderID } from "../provider/schema"
 import {
@@ -53,10 +55,17 @@ import {
   TEXT_NGRAM_RECOVERY_REMIND,
   TEXT_NGRAM_RECOVERY_REPLAN,
 } from "../session/prompt/text-ngram-detection"
+import {
+  EMPTY_STEP_MAX_RECOVERY,
+  EMPTY_STEP_RECOVERY_REMIND,
+  EMPTY_STEP_RECOVERY_REPLAN,
+  isEmptyStep,
+} from "../session/prompt/empty-step-detection"
 import { composeSkillsBlock } from "@/skill/compose/extract"
 import { builtinSkillRoot, matchDocumentSkills } from "@/skill/builtin/extract"
 import { ToolRegistry } from "../tool"
 import { MCP } from "../mcp"
+import { normalizeToolResult } from "../mcp/tool-result"
 import { LSP } from "../lsp"
 import { Flag } from "../flag/flag"
 import { ulid } from "ulid"
@@ -80,7 +89,7 @@ import {
 import { prefixCaptureRef } from "./prefix-capture-ref"
 import { spawnRef } from "@/actor/spawn-ref"
 import { Inbox } from "@/inbox"
-import { sessionPromptRef } from "@/inbox/inbox-ref"
+import { sessionPromptRef, defaultModelRef } from "@/inbox/inbox-ref"
 import { Tool } from "@/tool"
 import { Permission } from "@/permission"
 import { SessionStatus } from "./status"
@@ -105,6 +114,7 @@ import { Team } from "@/team"
 import { ActorRegistry } from "@/actor/registry"
 import { Metrics } from "@/metrics"
 import { resolveInvocationStyle, type ToolStyleConfig } from "../tool/invocation-style"
+import { ToolResultError } from "../tool/result-error"
 import { shouldAutoDream, shouldAutoDistill, DREAM_TASK, DISTILL_TASK, AUTO_DREAM_TITLE, AUTO_DISTILL_TITLE } from "./auto-dream"
 
 // @ts-ignore
@@ -122,6 +132,22 @@ export function recallHintLines(toolCfg: ToolStyleConfig | undefined): string[] 
       : `- actor({ operation: "status", actor_id: "<id>" })`
   // memory 没有 shell 形态（无 shell.parse）→ 始终是 JSON。
   return [`- memory({ operation: "search", query: "<keyword>" })`, taskHint, actorHint]
+}
+
+// The orchestrator root session is PERSISTENT and coordinates many tasks over
+// its lifetime, so its title must be stable and task-independent — it must not
+// be renamed by the per-first-message auto-title generator as tasks come and
+// go. Any root session driven by the orchestrator agent keeps this fixed name.
+export const ORCHESTRATOR_TITLE = "Orchestrator"
+
+// Returns the stable, task-independent title a root session should keep instead
+// of a per-message auto-generated one, or undefined when normal auto-titling
+// applies. Pure + exported for unit testing. `agent` is the triggering agent's
+// name (e.g. "orchestrator"); `parentID` distinguishes root from child sessions.
+export function stableRootTitle(input: { agent: string | undefined; parentID: string | undefined }): string | undefined {
+  if (input.parentID) return undefined
+  if (input.agent === "orchestrator") return ORCHESTRATOR_TITLE
+  return undefined
 }
 
 /**
@@ -237,8 +263,8 @@ export interface Interface {
   readonly command: (input: CommandInput) => Effect.Effect<MessageV2.WithParts>
   // 把含占位符的模板字符串解析成实际的消息 parts(给 command/shell 复用)。
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
-  // 清理"孤儿"助手消息:上次因崩溃/中断而没写完(无 completed)的残留消息。
-  readonly sweepOrphanAssistants: (sessionID: SessionID) => Effect.Effect<void>
+  // 清理"孤儿"助手消息:上次因崩溃/中断而没写完(无 completed)的残留消息。immediate 为 true 时立即清理。
+  readonly sweepOrphanAssistants: (sessionID: SessionID, immediate?: boolean) => Effect.Effect<void>
   // 预测:根据当前会话内容生成一段预测/建议文本(辅助功能)。
   readonly predict: (input: { sessionID: SessionID }) => Effect.Effect<string>
 }
@@ -373,6 +399,49 @@ export const layer = Layer.effect(
     })
 
     // ============================================================================
+    // rebuildFromCheckpoint:从 checkpoint 重建上下文的"共享步骤",被两条路径复用——
+    // runLoop 里的自动溢出路径 + 手动 /rebuild 命令,保证二者逻辑/边界条件永不漂移。
+    // 它在当前 watermark 处插入一个 checkpoint 边界标记(绝不删 DB 消息):下一次 runLoop
+    // 迭代会从磁盘上的 checkpoint 重建上下文,而 watermark 之后的实时消息尾巴原样保留。
+    // 不阻塞等待在途的 writer(与自动路径同策略——宁可用略旧的 checkpoint,也不等一个
+    // 可能永远不来的新的)。仅当成功插入边界(即存在可用 checkpoint)才返回 true;
+    // 返回 false 时调用方回退到 compaction。
+    // ============================================================================
+    const rebuildFromCheckpoint = Effect.fn("SessionPrompt.rebuildFromCheckpoint")(function* (input: {
+      sessionID: SessionID
+      msgs: MessageV2.WithParts[]
+      agentID?: string
+      agent: string
+      model: { providerID: string; id: string }
+    }) {
+      const hasCP = yield* checkpoint
+        .hasCheckpoint(input.sessionID)
+        .pipe(Effect.catch(() => Effect.succeed(false)))
+      if (!hasCP) return false
+
+      const boundary = yield* checkpoint
+        .lastBoundary(input.sessionID)
+        .pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (!boundary) return false
+
+      const boundaryMsg = input.msgs.find((m) => m.info.id === boundary)
+      const inserted = yield* checkpoint
+        .insertRebuildBoundary({
+          sessionID: input.sessionID,
+          boundary,
+          lastMessageInfo: computeLastMessageInfo(input.msgs.map((m) => m.info)),
+          agentID: input.agentID,
+          agent: input.agent,
+          model: { providerID: input.model.providerID, modelID: input.model.id },
+          boundaryCreatedAt: boundaryMsg?.info.time.created,
+        })
+        .pipe(Effect.catch(() => Effect.succeed(false)))
+
+      if (inserted) yield* prune.resetThresholds(input.sessionID)
+      return inserted
+    })
+
+    // ============================================================================
     // resolvePromptParts:处理用户输入里的 `@` 引用。
     //
     // 例:用户输入 "看下 @src/app.ts,再让 @explore 去调研"
@@ -437,6 +506,7 @@ export const layer = Layer.effect(
     // ============================================================================
     const title = Effect.fn("SessionPrompt.ensureTitle")(function* (input: {
       session: Session.Info
+      agent: string | undefined
       history: MessageV2.WithParts[]
       providerID: ProviderID
       modelID: ModelID
@@ -444,6 +514,20 @@ export const layer = Layer.effect(
       // --- 一堆守卫:只在"该起标题"的时候才干活,否则直接返回 ---
       // 是子会话(被派生出来的小弟,用户看不到)→ 不用起标题
       if (input.session.parentID) return
+      // 持久编排器根会话:保持一个稳定、与任务无关的标题。若仍是默认标题就设一次,
+      // 并跳过"按首条消息生成标题"的 LLM 流程,这样后续任务永远不会重命名它。
+      // Persistent orchestrator root session: keep a stable, task-independent
+      // title. Set it once (if still the default) and SKIP the per-first-message
+      // LLM title generation so later tasks never rename it.
+      const stable = stableRootTitle({ agent: input.agent, parentID: input.session.parentID })
+      if (stable) {
+        if (Session.isDefaultTitle(input.session.title))
+          yield* sessions
+            .setTitle({ sessionID: input.session.id, title: stable })
+            .pipe(Effect.catchCause((cause) => elog.error("failed to set stable title", { error: Cause.squash(cause) })))
+        return
+      }
+
       // 标题已经不是默认值了(用户改过 / 之前已生成过)→ 别覆盖
       if (!Session.isDefaultTitle(input.session.title)) return
 
@@ -743,8 +827,10 @@ ${entries}
         (p) => p.type === "text" && p.text.startsWith('<skill_content name="'),
       )
       if (!alreadyWrapped) {
-        const availableSkills = yield* sys.available(input.agent)
-        if (availableSkills.length > 0) {
+        // Use all() to include hidden skills (primarily compose:*) — respect the user's explicit /mention action
+        // 用 all() 以包含隐藏技能(主要是 compose:*)——尊重用户显式的 /提及 动作
+        const allSkills = yield* sys.all()
+        if (allSkills.length > 0) {
           // 步骤1——把用户消息的文本拼起来,并"净化":抠掉 ```代码块``` 和 `行内代码`。
           // 目的:防止用户贴的代码里正好有个 "/research" 字符串被误当成技能引用。
           const bodyText = userMessage.parts
@@ -758,11 +844,11 @@ ${entries}
           // 保证完整匹配一个词。两个过滤:去重(seen) + 必须是真实存在的技能(availableSkills)。
           const mentioned: string[] = []
           const seen = new Set<string>()
-          const mentionRe = /(?:^|\s)\/([A-Za-z][A-Za-z0-9_-]*)(?=[^A-Za-z0-9_-]|$)/g
+          const mentionRe = /(?:^|\s)\/([A-Za-z][A-Za-z0-9_:-]*)(?=[^A-Za-z0-9_:-]|$)/g
           for (const m of stripped.matchAll(mentionRe)) {
             const name = m[1]
             if (!name || seen.has(name)) continue
-            if (!availableSkills.some((s) => s.name === name)) continue
+            if (!allSkills.some((s) => s.name === name)) continue
             seen.add(name)
             mentioned.push(name)
           }
@@ -774,7 +860,7 @@ ${entries}
             const toLoad = mentioned.slice(0, MAX_AUTOLOAD)
             const overflow = mentioned.slice(MAX_AUTOLOAD)
             for (const name of toLoad) {
-              const info = availableSkills.find((s) => s.name === name)
+              const info = allSkills.find((s) => s.name === name)
               if (!info) continue
               // 用 <skill_content> 标签包裹内容(给模型划清边界,防内容串味)。
               const part = yield* sessions.updatePart({
@@ -1137,6 +1223,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       })
       const askInteractive = askRouting.interactive // 权限询问:是否弹窗问真人
       const askForward = askRouting.forward // 权限询问:是否转发给上级审批
+      const askInherit = askRouting.inherit // 权限询问:是否继承父级已持有的授权
       // rejectionFor:被白名单拦下时返回的统一"拒绝"输出(附上允许的工具清单,便于排查)。
       const rejectionFor = (toolID: string) => ({
         title: "Tool not permitted",
@@ -1184,10 +1271,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 sessionID: input.session.id,
                 tool: { messageID: input.processor.message.id, callID: options.toolCallId },
                 ruleset: Agent.runtimePermission(input.agent, input.session.permission),
-                // 系统派生 + 非对等的后台 agent 没有人类来回答
-                // → 干净失败，不要挂起。编排器对等 agent 则转发（FORWARD）以请求审批。
+                // System-spawned + non-peer background agents have no human to answer
+                // → fail clean, don't hang. Orchestrator peers FORWARD for approval;
+                // ordinary background subagents INHERIT the parent's held grants.
+                // 系统派生 + 非对等的后台 agent 没有人类来回答 → 干净失败,不要挂起。
+                // 编排器对等 agent 转发(FORWARD)请求审批;普通后台子 agent 则继承(INHERIT)父级已持有的授权。
                 interactive: askInteractive,
                 ...(askForward ? { forward: askForward } : {}),
+                ...(askInherit ? { inherit: askInherit } : {}),
               },
               options.abortSignal,
             )
@@ -1383,78 +1474,67 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.promise(() =>
                 execute(mcpBeforeOutput.args, opts),
               )
-              log.debug("tool execute done (mcp)", {
-                tool: key,
-                callID,
-                durationMs: Date.now() - startTs,
-                ok: true,
-              })
               yield* plugin.trigger(
                 "tool.execute.after",
                 { tool: key, sessionID: ctx.sessionID, callID: opts.toolCallId, args },
                 result,
               )
 
-              const textParts: string[] = []
+              const normalized = normalizeToolResult(result)
+              log.debug("tool execute done (mcp)", {
+                tool: key,
+                callID,
+                durationMs: Date.now() - startTs,
+                ok: !normalized.isError,
+              })
+
+              const truncated = yield* truncate.output(
+                normalized.output,
+                { outcome: normalized.isError ? "error" : "success" },
+                input.agent,
+              )
+              const metadata = {
+                ...normalized.metadata,
+                truncated: truncated.truncated,
+                ...(truncated.truncated && { outputPath: truncated.outputPath }),
+              }
+              const attachments = normalized.attachments.map((attachment) => ({
+                type: "file" as const,
+                ...attachment,
+                id: PartID.ascending(),
+                sessionID: ctx.sessionID,
+                messageID: input.processor.message.id,
+              }))
+
+              if (normalized.isError) {
+                return yield* Effect.fail(
+                  new ToolResultError(
+                    truncated.content.trim() || "MCP tool execution failed",
+                    metadata,
+                    attachments,
+                  ),
+                )
+              }
+
               yield* bus
                 .publish(Metrics.ToolCall, {
                   sessionID: ctx.sessionID,
                   tool_name: key,
                   input_bytes: Metrics.jsonByteLength(args),
-                  output_bytes: Metrics.jsonByteLength(result.content ?? ""),
+                  output_bytes: Metrics.jsonByteLength({
+                    content: normalized.content,
+                    structuredContent: normalized.structuredContent,
+                  }),
                   tool_call_id: opts.toolCallId,
                   tool_call_status: "success",
                 })
                 .pipe(Effect.ignore)
-              // 拆分 MCP 返回的 content 数组:文本收集进 textParts,图片/二进制转成 data URL 附件。
-              // (模型上下文是文本通道,吃不下原始二进制,只能吃"编码后文本"或走附件通道。)
-              const attachments: Omit<MessageV2.FilePart, "id" | "sessionID" | "messageID">[] = []
-              for (const contentItem of result.content) {
-                if (contentItem.type === "text") textParts.push(contentItem.text) // 文本:直接收集
-                else if (contentItem.type === "image") {
-                  // 图片:base64 数据包成 data URL 附件(data:类型;base64,数据)。
-                  attachments.push({
-                    type: "file",
-                    mime: contentItem.mimeType,
-                    url: `data:${contentItem.mimeType};base64,${contentItem.data}`,
-                  })
-                } else if (contentItem.type === "resource") {
-                  // 资源:分文本形态和二进制(blob)形态。
-                  const { resource } = contentItem
-                  if (resource.text) textParts.push(resource.text) // 文本资源 → 收集
-                  if (resource.blob) {
-                    // 二进制资源 → data URL 附件(blob 本身已是 base64;类型未知则兜底 octet-stream)。
-                    attachments.push({
-                      type: "file",
-                      mime: resource.mimeType ?? "application/octet-stream",
-                      url: `data:${resource.mimeType ?? "application/octet-stream"};base64,${resource.blob}`,
-                      filename: resource.uri,
-                    })
-                  }
-                }
-              }
-
-              // 防爆上下文:文本太长就截断(只留头尾预览),全文落盘到 outputPath,让模型需要时自己 read。
-              const truncated = yield* truncate.output(textParts.join("\n\n"), {}, input.agent)
-              const metadata = {
-                ...result.metadata,
-                truncated: truncated.truncated,
-                // 条件展开:只有截断了才加 outputPath 字段(false 展开等于不加)。
-                ...(truncated.truncated && { outputPath: truncated.outputPath }),
-              }
-
-              // 组装最终输出:output=给模型看的正文(全文或预览);attachments 补齐身份;content 留原始结构备查。
+              // 组装最终输出:output=给模型看的正文(全文或预览),metadata/attachments 取自上方 normalized 处理。
               const output = {
                 title: "",
                 metadata,
                 output: truncated.content,
-                attachments: attachments.map((attachment) => ({
-                  ...attachment,
-                  id: PartID.ascending(),
-                  sessionID: ctx.sessionID,
-                  messageID: input.processor.message.id,
-                })),
-                content: result.content,
+                attachments,
               }
               // 兜底:被取消时主动落库,避免僵尸态(同循环A)。
               if (opts.abortSignal?.aborted) {
@@ -2293,7 +2373,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return { info, parts }
     }, Effect.scoped)
 
-    const sweepOrphanAssistants = Effect.fn("SessionPrompt.sweepOrphanAssistants")(function* (sessionID: SessionID) {
+    const sweepOrphanAssistants = Effect.fn("SessionPrompt.sweepOrphanAssistants")(function* (
+      sessionID: SessionID,
+      // When true, sweep dangling assistants regardless of age. The caller sets
+      // this when the session is idle (no active runner), meaning any assistant
+      // without time.completed is definitively orphaned — left behind by a hard
+      // interruption (process crash / kill / disconnect) that skipped the normal
+      // `finish` effect, not an in-flight retry chain. Sweeping immediately
+      // matters because the TUI derives its "pending" marker from the newest
+      // incomplete assistant (routes/session/index.tsx `pending`): a stale
+      // orphan otherwise makes EVERY newly submitted message on an idle session
+      // render as stuck QUEUED for up to ORPHAN_AGE_MS (an hour). Defaults to
+      // false so background callers (spawn/hook) keep the age guard.
+      immediate = false,
+    ) {
       const msgs = yield* sessions.messages({ sessionID, agentID: "*" })
       const now = Date.now()
       // 1 小时——必须超过 Task 1 的 chunkMs（300s）加上 Task 2 的
@@ -2305,7 +2398,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         if (m.info.role !== "assistant") continue
         if (m.info.time?.completed) continue
         const created = m.info.time?.created ?? 0
-        if (now - created < ORPHAN_AGE_MS) continue
+        if (!immediate && now - created < ORPHAN_AGE_MS) continue
         m.info.time = { ...m.info.time, completed: now }
         m.info.error =
           m.info.error ??
@@ -2333,7 +2426,11 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         const session = yield* sessions.get(input.sessionID)
         if (input.source !== "spawn" && input.source !== "hook") {
           yield* revert.cleanup(session)
-          yield* sweepOrphanAssistants(input.sessionID)
+          // An idle session has no active runner, so any dangling assistant is a
+          // true orphan from a hard interruption — sweep it now (age-independent)
+          // so a fresh message is not rendered as stuck QUEUED behind it.
+          const idle = (yield* status.get(input.sessionID)).type === "idle"
+          yield* sweepOrphanAssistants(input.sessionID, idle)
         }
         const message = yield* createUserMessage(input)
         yield* sessions.touch(input.sessionID)
@@ -2371,10 +2468,13 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID, agentID?: string, task_id?: string) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
-      "SessionPrompt.run",
-    )(
-      function* (sessionID: SessionID, agentID?: string, task_id?: string) {
+    const runLoop: (
+      sessionID: SessionID,
+      agentID?: string,
+      task_id?: string,
+      notifyParentOnComplete?: boolean,
+    ) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.run")(
+      function* (sessionID: SessionID, agentID?: string, task_id?: string, notifyParentOnComplete?: boolean) {
         const ctx = yield* InstanceState.context
         const slog = elog.with({ sessionID })
         let structured: unknown | undefined
@@ -2394,6 +2494,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         // 针对文本形式工具调用（模型把工具调用写成了散文文本而非结构化的 tool_use）的
         // 有限次重试。局部于 runLoop，这样每一轮新的用户 turn 都从干净状态开始。
         let textToolCallRetries = 0
+        // Consecutive empty/no-op tool-call steps in this turn. Counts steps
+        // where the model "called a tool" with empty/invalid input, or produced
+        // no valid tool part and no substantive output at all (see isEmptyStep).
+        // A single non-empty step resets it. Escalates soft (remind → replan)
+        // then hard-halts once it exceeds EMPTY_STEP_MAX_RECOVERY, mirroring the
+        // text-ngram ladder. Local to runLoop so a fresh user turn starts clean.
+        let emptyStepStreak = 0
+        // Set true when a guard hard-halts the turn (currently the empty-step
+        // guard). A hard halt is terminal: it must break out immediately and
+        // NOT be re-entered by the taskGate / goalGate ReAct gates, which would
+        // otherwise inject a fresh user turn and re-drive a still-degraded model
+        // into the same loop.
+        let hardHalt = false
         const resolvedAgentID = agentID ?? "main"
         // 跟踪由插件驱动的取消（session.pre 或任意 session.userQuery.pre），
         // 使 session.post 报告 outcome="cancelled" 而非 "error"。
@@ -2929,9 +3042,96 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           return true
         })
 
-        // content-filter 在首次出现时即为终止性：重发同一个 turn 只会再次被过滤，
-        // 所以没有提示 / 计数器。写入一个用户可见的错误（通过 session.error toast
-        // 渲染），并让调用方 break。
+        // Empty/no-op tool-call loop guard. Symmetric across main and fork
+        // branches, mirroring handleTextRepeat's soft→hard ladder but keyed on
+        // *empty steps* (empty/invalid tool input, or a fully empty terminal)
+        // rather than repeated text n-grams — the gap TEXT_NGRAM and
+        // stepSignature both miss (an empty tool call has no text to match and
+        // is dropped by stepSignature's undefined path).
+        //
+        // Returns:
+        //   "none"     — the step was NOT empty; streak reset, caller continues
+        //                normal classification.
+        //   "continue" — empty step, still within the soft-nudge budget; a
+        //                remind/replan reminder was injected, caller should loop.
+        //   "halt"     — empty streak exceeded EMPTY_STEP_MAX_RECOVERY; a
+        //                terminal error was published, caller must break.
+        const handleEmptyStep = Effect.fn("SessionPrompt.handleEmptyStep")(function* (input: {
+          lastUser: MessageV2.User
+          assistant: MessageV2.Assistant
+        }) {
+          // Never mask a genuine terminal outcome as an "empty loop": an errored
+          // step, a content-filter/error finish, or an already-resolved
+          // structured/summary step must fall through to its own classifier
+          // handler (writeContentFilterError / writeModelError / final). Those
+          // are terminal safety/error events, not a spinning no-op.
+          if (
+            input.assistant.error ||
+            input.assistant.summary ||
+            input.assistant.structured !== undefined ||
+            input.assistant.finish === "content-filter" ||
+            input.assistant.finish === "error"
+          ) {
+            return "none" as const
+          }
+          const parts = MessageV2.parts(input.assistant.id)
+          if (!isEmptyStep(parts)) {
+            emptyStepStreak = 0
+            return "none" as const
+          }
+          emptyStepStreak++
+          if (emptyStepStreak > EMPTY_STEP_MAX_RECOVERY) {
+            yield* slog.info("empty step: max recovery exceeded, terminating", { streak: emptyStepStreak })
+            hardHalt = true
+            // Discard the empty turn from request history so it can neither
+            // strand the conversation on an assistant prefill nor poison later
+            // context (toModelMessages skips a message whose info.error is set).
+            if (!input.assistant.error) {
+              input.assistant.error = new NamedError.Unknown({
+                message: `Empty tool call loop detected: ${emptyStepStreak} consecutive empty/no-op steps after ${EMPTY_STEP_MAX_RECOVERY} recovery attempts. Session terminated.`,
+              }).toObject()
+              yield* sessions.updateMessage(input.assistant)
+            }
+            yield* bus.publish(Session.Event.Error, {
+              sessionID,
+              error: new NamedError.Unknown({
+                message: `Empty tool call loop detected: ${emptyStepStreak} consecutive empty/no-op steps after ${EMPTY_STEP_MAX_RECOVERY} recovery attempts. Session terminated.`,
+              }).toObject(),
+            })
+            return "halt" as const
+          }
+          const recoveryText =
+            emptyStepStreak === 1 ? EMPTY_STEP_RECOVERY_REMIND : EMPTY_STEP_RECOVERY_REPLAN
+          const reentry = yield* sessions.updateMessage({
+            id: MessageID.ascending(),
+            role: "user" as const,
+            sessionID,
+            agentID: input.lastUser.agentID,
+            agent: input.lastUser.agent,
+            model: input.lastUser.model,
+            tools: input.lastUser.tools,
+            format: input.lastUser.format,
+            time: { created: Date.now() },
+          })
+          yield* sessions.updatePart({
+            id: PartID.ascending(),
+            messageID: reentry.id,
+            sessionID,
+            type: "text",
+            synthetic: true,
+            text: recoveryText,
+          } satisfies MessageV2.TextPart)
+          yield* slog.info("empty step: recovery injected", { streak: emptyStepStreak })
+          return "continue" as const
+        })
+
+
+        // content-filter is terminal on first occurrence: re-sending the same
+        // turn would just get filtered again, so there is no nudge / counter.
+        // Write a user-visible error (rendered via the session.error toast) and
+        // let the caller break.
+        // content-filter 在首次出现时即为终止性:重发同一个 turn 只会再次被过滤,
+        // 所以没有提示 / 计数器。写入一个用户可见的错误(通过 session.error toast 渲染),并让调用方 break。
         const writeContentFilterError = Effect.fn("SessionPrompt.writeContentFilterError")(function* (input: {
           assistant: MessageV2.Assistant
         }) {
@@ -3089,9 +3289,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           step++
+          // Per-step turn heartbeat: only writer of turn_count; advances last_turn_time/time_updated so the orchestrator can tell progressing children from stalled ones. Safe 0-row no-op when no registry row exists.
+          yield* actorRegistry.updateTurn(sessionID, resolvedAgentID).pipe(Effect.ignore)
           if (step === 1)
             yield* title({
               session,
+              agent: lastUser.agent,
               modelID: lastUser.model.modelID,
               providerID: lastUser.model.providerID,
               history: msgs,
@@ -3326,36 +3529,24 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               continue
             }
 
-            // 主 agent 溢出：插入一个 checkpoint 边界标记（绝不删除 DB 消息），使下一次
-            // 迭代从最新的 checkpoint 重建。只有在无法产生边界时才回退到 compaction。
-            const hasCP = yield* checkpoint.hasCheckpoint(sessionID).pipe(Effect.catch(() => Effect.succeed(false)))
-            if (hasCP) {
-              // 等待任何正在运行的 writer，以便拿到最新的 checkpoint
-              yield* checkpoint.waitForWriter(sessionID).pipe(Effect.ignore)
-
-              const boundary = yield* checkpoint
-                .lastBoundary(sessionID)
-                .pipe(Effect.catch(() => Effect.succeed(undefined)))
-              const boundaryMsg = boundary ? msgs.find((m) => m.info.id === boundary) : undefined
-              const inserted = boundary
-                ? yield* checkpoint
-                    .insertRebuildBoundary({
-                      sessionID,
-                      boundary,
-                      lastMessageInfo: computeLastMessageInfo(msgs.map((m) => m.info)),
-                      agentID: lastUser.agentID,
-                      agent: lastUser.agent,
-                      model: { providerID: model.providerID, modelID: model.id },
-                      boundaryCreatedAt: boundaryMsg?.info.time.created,
-                    })
-                    .pipe(Effect.catch(() => Effect.succeed(false)))
-                : false
-
-              if (inserted) {
-                yield* prune.resetThresholds(sessionID)
-                skipOverflowCheck = true
-                continue
-              }
+            // Main-agent overflow: insert a checkpoint boundary marker (never
+            // deletes DB messages) so the next iteration rebuilds from the
+            // freshest checkpoint. Shared with the manual `/rebuild` command via
+            // rebuildFromCheckpoint so logic/boundary conditions can't drift.
+            // Falls back to compaction only when no boundary can be produced.
+            // 主 agent 溢出:插入一个 checkpoint 边界标记(绝不删 DB 消息),使下一次迭代从最新
+            // checkpoint 重建。通过共享 helper rebuildFromCheckpoint 与手动 /rebuild 命令复用同一逻辑,
+            // 避免漂移。只有在无法产生边界时才回退到 compaction。
+            const inserted = yield* rebuildFromCheckpoint({
+              sessionID,
+              msgs,
+              agentID: lastUser.agentID,
+              agent: lastUser.agent,
+              model: { providerID: model.providerID, id: model.id },
+            })
+            if (inserted) {
+              skipOverflowCheck = true
+              continue
             }
 
             // F39：没有 checkpoint——回退到 compaction（LLM 驱动的有损摘要）。
@@ -3614,6 +3805,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 return "break" as const
               }
 
+              // Empty/no-op tool-call loop guard (fork branch). Intercept before
+              // classify would `continue` an empty tool-calls step: soft-nudge
+              // within budget, hard-halt once exceeded. A non-empty step returns
+              // "none" and falls through to normal classification.
+              const forkEmptyStep = yield* handleEmptyStep({ lastUser, assistant: handle.message })
+              if (forkEmptyStep === "halt") return "break" as const
+              if (forkEmptyStep === "continue") return "continue" as const
+
               const forkClassification = classifyAssistantStep({
                 phase: "after-process",
                 lastUser,
@@ -3826,6 +4025,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               return "break" as const
             }
 
+            // Empty/no-op tool-call loop guard (main branch). Intercept before
+            // classify would `continue` an empty tool-calls step: soft-nudge
+            // within budget, hard-halt once exceeded. A non-empty step returns
+            // "none" and falls through to normal classification.
+            const emptyStep = yield* handleEmptyStep({ lastUser, assistant: handle.message })
+            if (emptyStep === "halt") return "break" as const
+            if (emptyStep === "continue") return "continue" as const
+
             const classification = classifyAssistantStep({
               phase: "after-process",
               lastUser,
@@ -3883,38 +4090,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 return "continue" as const
               }
 
-              // 主 agent 由 provider 发出信号的溢出：插入一个 checkpoint 边界标记
-              //（绝不删除）。优先 rebuild 而非 compaction：如果有 writer 正在运行或已完成，
-              // 就（有界地）等待并从它 rebuild。只有在不存在边界时才回退到 compaction。
-              const writerRunning = yield* checkpoint.isWriterRunning(sessionID)
-                .pipe(Effect.catch(() => Effect.succeed(false)))
-              const hasCP = yield* checkpoint.hasCheckpoint(sessionID)
-                .pipe(Effect.catch(() => Effect.succeed(false)))
-
-              if (writerRunning || hasCP) {
-                yield* checkpoint.waitForWriter(sessionID).pipe(Effect.ignore)
-                const boundary2 = yield* checkpoint.lastBoundary(sessionID)
-                  .pipe(Effect.catch(() => Effect.succeed(undefined)))
-                const boundary2Msg = boundary2 ? msgs.find((m) => m.info.id === boundary2) : undefined
-                const inserted2 = boundary2
-                  ? yield* checkpoint
-                      .insertRebuildBoundary({
-                        sessionID,
-                        boundary: boundary2,
-                        lastMessageInfo: computeLastMessageInfo(msgs.map((m) => m.info)),
-                        agentID: lastUser.agentID,
-                        agent: lastUser.agent,
-                        model: { providerID: model.providerID, modelID: model.id },
-                        boundaryCreatedAt: boundary2Msg?.info.time.created,
-                      })
-                      .pipe(Effect.catch(() => Effect.succeed(false)))
-                  : false
-
-                if (inserted2) {
-                  yield* prune.resetThresholds(sessionID)
-                  return "continue" as const
-                }
-              }
+              // Main-agent provider-signalled overflow: prefer rebuild over
+              // compaction. Shared with the manual `/rebuild` command via
+              // rebuildFromCheckpoint (does not block on the writer; uses the
+              // on-disk checkpoint). Fall back to compaction only when no
+              // boundary can be produced.
+              // 主 agent 由 provider 发出信号的溢出:优先 rebuild 而非 compaction。通过共享 helper
+              // rebuildFromCheckpoint 与手动 /rebuild 命令复用(不阻塞等待 writer;用磁盘上的 checkpoint)。
+              // 只有在无法产生边界时才回退到 compaction。
+              const inserted2 = yield* rebuildFromCheckpoint({
+                sessionID,
+                msgs,
+                agentID: lastUser.agentID,
+                agent: lastUser.agent,
+                model: { providerID: model.providerID, id: model.id },
+              })
+              if (inserted2) return "continue" as const
 
               // F39：没有 checkpoint——回退到 compaction（LLM 驱动的有损摘要）。
               yield* compaction
@@ -3992,6 +4183,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
 
           if (outcome === "break") {
+            // A hard halt is terminal — skip the ReAct re-entry gates so a
+            // degraded model can't be re-driven into the same empty loop.
+            if (hardHalt) break
             if (yield* taskGate(lastUser)) continue
             if (yield* goalGate(lastUser)) continue
             break
@@ -4022,6 +4216,49 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           finalIsError ? "error" : "completed",
           Option.isSome(lastUserForMetrics) ? lastUserForMetrics.value.info.agent : final.info.agent,
         )
+        // Woken-peer completion signal. forkWork.notify only wraps the FIRST
+        // (spawn) turn; a persistent background peer that finishes a later,
+        // inbox-driven turn would otherwise go idle silently and force the
+        // orchestrator to poll. When this loop was woken via the inbox path
+        // (notifyParentOnComplete), mirror forkWork's actor_notification to the
+        // parent so the event-driven model holds. Gated to background peers and
+        // excludes system subagents (checkpoint-writer/dream/distill). The flag
+        // is never set on the spawn turn, so turn 1 is not double-notified.
+        if (notifyParentOnComplete && agentID && session.parentID) {
+          const actor = yield* actorRegistry.get(sessionID, agentID)
+          if (
+            actor &&
+            actor.mode === "peer" &&
+            actor.background &&
+            !SYSTEM_SPAWNED_AGENT_TYPES.has(actor.agent)
+          ) {
+            const finalText =
+              final.info.role === "assistant" ? assistantFinalText(final.info, final.parts) : undefined
+            const parsed = parseReturnHeader(finalText)
+            const status = finalIsError ? "failed" : "completed"
+            yield* inbox
+              .send({
+                receiverSessionID: session.parentID,
+                receiverActorID: actor.parentActorID ?? "main",
+                senderSessionID: sessionID,
+                senderActorID: agentID,
+                type: "actor_notification",
+                content: renderActorNotification({
+                  actorID: agentID,
+                  description: actor.description,
+                  status,
+                  ...(status === "completed"
+                    ? {
+                        result: finalText ?? "(no output)",
+                        ...(parsed.status ? { reportedStatus: parsed.status } : {}),
+                        ...(parsed.summary ? { reportedSummary: parsed.summary } : {}),
+                      }
+                    : { error: final.info.role === "assistant" ? sessionErrorText(final.info.error) : "unknown" }),
+                }),
+              })
+              .pipe(Effect.ignore)
+          }
+        }
         return final
         }).pipe(Effect.onExit(firePostSession), Effect.orDie)
       },
@@ -4035,7 +4272,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         input.sessionID,
         agentID,
         lastAssistant(input.sessionID, agentID),
-        runLoop(input.sessionID, agentID, input.task_id),
+        runLoop(input.sessionID, agentID, input.task_id, input.notifyParentOnComplete),
       )
     })
 
@@ -4073,6 +4310,43 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           })
         }
         yield* goal.set(input.sessionID, condition)
+      }
+
+      // /rebuild — manually rebuild the conversation context now, from the
+      // latest checkpoint. Reuses the SAME rebuildFromCheckpoint step as the
+      // automatic overflow path (identical logic + boundary conditions), so a
+      // user-triggered rebuild behaves exactly like an auto one: it inserts a
+      // checkpoint boundary at the watermark (recent messages after it are kept
+      // verbatim; earlier ones collapse to the checkpoint summary on the next
+      // turn). If no usable checkpoint exists yet, tell the user rather than
+      // silently doing nothing — the first checkpoint has to be produced by
+      // normal turns before there is anything to rebuild from.
+      if (input.command === Command.Default.REBUILD) {
+        const msgs = yield* sessions.messages({ sessionID: input.sessionID, agentID: "main" })
+        const lastUser = msgs.findLast((m) => m.info.role === "user")
+        const model = yield* lastModel(input.sessionID)
+        const inserted = yield* rebuildFromCheckpoint({
+          sessionID: input.sessionID,
+          msgs,
+          agentID: lastUser?.info.agentID ?? "main",
+          agent: agentName,
+          model: { providerID: model.providerID, id: model.modelID },
+        }).pipe(Effect.catch(() => Effect.succeed(false)))
+        return yield* prompt({
+          sessionID: input.sessionID,
+          messageID: input.messageID,
+          agent: agentName,
+          parts: [
+            {
+              type: "text",
+              text: inserted
+                ? "Context rebuilt from the latest checkpoint. Recent messages are preserved; earlier context is now summarized."
+                : "No checkpoint is available to rebuild from yet — continue the conversation and a checkpoint will be written automatically.",
+              synthetic: true,
+            },
+          ],
+          noReply: true,
+        })
       }
 
       const raw = input.arguments.match(argsRegex) ?? []
@@ -4213,9 +4487,16 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       predict,
     })
     sessionPromptRef.current = { loop: impl.loop }
+    // Expose the project default-model resolver to Inbox.drain's option-2
+    // fallback (seed a synthetic message for a turnCount-0 standing peer whose
+    // slice has no model-bearing message yet). Reads Provider, which is already
+    // in scope here — Inbox.layer stays free of a Provider dependency.
+    const defaultModelResolver = { defaultModel: () => provider.defaultModel() }
+    defaultModelRef.current = defaultModelResolver
     yield* Effect.addFinalizer(() =>
       Effect.sync(() => {
         if (sessionPromptRef.current?.loop === impl.loop) sessionPromptRef.current = undefined
+        if (defaultModelRef.current === defaultModelResolver) defaultModelRef.current = undefined
       }),
     )
     return impl
@@ -4341,6 +4622,11 @@ export const LoopInput = z.object({
   sessionID: SessionID.zod,
   agentID: z.string().optional(),
   task_id: z.string().optional(),
+  // Set by the inbox wake path so a persistent background peer that finishes a
+  // woken turn notifies its parent (mirroring forkWork.notify, which only wraps
+  // the FIRST/spawn turn). Left false on spawn/user-driven loops to avoid
+  // double-notifying the spawn turn that forkWork already covers.
+  notifyParentOnComplete: z.boolean().optional(),
 })
 
 export const ShellInput = z.object({

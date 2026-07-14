@@ -51,6 +51,8 @@ export const dict = {
   "tui.tips.shell_prefix":
     "Commencez un message par {highlight}!{/highlight} pour exécuter directement des commandes shell (ex. {highlight}!ls -la{/highlight})",
   "tui.tips.tab_agent":
+    "Appuyez sur {highlight}Tab{/highlight} ou {highlight}Shift+Tab{/highlight} pour basculer entre les agents Build, Plan et Compose",
+  "tui.tips.tab_agent_orchestrator":
     "Appuyez sur {highlight}Tab{/highlight} ou {highlight}Shift+Tab{/highlight} pour basculer entre les agents Build, Plan, Compose et Orchestrator",
   "tui.tips.theme_mode":
     "Exécutez {highlight}/dark{/highlight} pour le mode sombre ou {highlight}/light{/highlight} pour le mode clair",
@@ -274,6 +276,7 @@ export const dict = {
   "tui.skill.html-to-video-pipeline.description": "L'arme ultime pour vidéos courtes — créez des vidéos courtes avec du HTML",
   "tui.skill.arxiv.description": "Rechercher, citer, télécharger et suivre des articles arXiv",
   "tui.skill.skill-creator.description": "Créer, réviser et améliorer des skills d'agent",
+  "tui.skill.drive-mimo.description": "Piloter un autre processus MiMoCode — événements JSON headless ou TUI interactive via tmux",
   "tui.skill.research-paper-writing.description": "Rédiger, polir et critiquer des articles académiques avec l'œil d'un relecteur",
   "tui.skill.design-blueprint.description":
     "Produire un plan de design (DESIGN.md + Decision Trace) avant tout mockup",
@@ -429,6 +432,7 @@ export const dict = {
   "tui.command.session.ask.title": "Poser une question annexe",
   "tui.command.session.ask.description": "Posez une question à la session actuelle sans la perturber",
   "tui.command.session.ask.placeholder": "Poser une question annexe…",
+  "tui.command.session.ask.busy": "Réflexion…",
   "tui.command.session.unshare.title": "Annuler le partage",
   "tui.command.session.undo.title": "Annuler le message précédent",
   "tui.command.session.redo.title": "Rétablir",

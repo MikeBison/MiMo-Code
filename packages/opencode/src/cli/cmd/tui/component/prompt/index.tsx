@@ -1,4 +1,4 @@
-import { BoxRenderable, RGBA, TextareaRenderable, MouseEvent, PasteEvent, decodePasteBytes } from "@opentui/core"
+import { BoxRenderable, RGBA, TextareaRenderable, MouseEvent, PasteEvent, decodePasteBytes, TextAttributes } from "@opentui/core"
 import { createEffect, createMemo, onMount, createSignal, onCleanup, on, Show, Switch, Match } from "solid-js"
 import "opentui-spinner/solid"
 import path from "path"
@@ -32,10 +32,12 @@ import { TuiEvent } from "../../event"
 import { iife } from "@/util/iife"
 import { Locale } from "@/util"
 import { formatDuration } from "@/util/format"
+import { SessionRetry } from "@/session/retry"
 import { createColors, createFrames } from "../../ui/spinner.ts"
 import { useDialog } from "@tui/ui/dialog"
 import { DialogProvider as DialogProviderConnect } from "../dialog-provider"
 import { DialogAlert } from "../../ui/dialog-alert"
+import { DialogPrompt } from "../../ui/dialog-prompt"
 import { useToast } from "../../ui/toast"
 import { useKV } from "../../context/kv"
 import { createFadeIn } from "../../util/signal"
@@ -1073,6 +1075,23 @@ export function Prompt(props: PromptProps) {
     try {
 
     let sessionID = props.sessionID
+    // In orchestrator mode the single global root session was already resolved
+    // (find-or-create) on mode entry and stashed. Submitting from the home
+    // composer must land the first message INTO that root rather than creating a
+    // duplicate root session. Only applies when the composer has no bound
+    // sessionID (home view) and the current agent is orchestrator.
+    if (sessionID == null && agent.name === "orchestrator") {
+      const stashed = local.orchestrator.sessionID()
+      if (stashed) {
+        sessionID = stashed
+      } else {
+        // Root not resolved yet (mode-entry find-or-create still in flight).
+        // Do NOT fall through to session.create — that would spawn a duplicate
+        // orchestrator root. Ask the user to retry in a moment instead.
+        toast.show({ message: "Orchestrator session is still initializing, try again", variant: "warning" })
+        return false
+      }
+    }
     if (sessionID == null) {
       const res = await sdk.client.session.create({ workspace: props.workspaceID })
 
@@ -1131,19 +1150,33 @@ export function Prompt(props: PromptProps) {
     } else if (inputText.startsWith("/btw ")) {
       // Inline side-question form: `/btw <question>` on the prompt line. Client
       // slashes match the exact `/btw` token and drop args, so handle the
-      // arg-bearing form here. READ-ONLY + EPHEMERAL: render the answer in a
-      // dismissible dialog, never inject it into the conversation.
+      // arg-bearing form here. Show a busy/spinner dialog immediately for
+      // instant feedback across the blocking fork-query, then swap in the
+      // answer. READ-ONLY + EPHEMERAL: render the answer in a dismissible
+      // dialog, never inject it into the conversation.
       const question = inputText.slice("/btw ".length).trim()
       if (question)
-        void sdk.client.session
-          .ask({ sessionID, question })
-          .then((res) => DialogAlert.show(dialog, "/btw", res.data?.answer ?? "(no answer)"))
-          .catch((err) => {
-            toast.show({
-              message: err instanceof Error ? err.message : "Failed to ask side question",
-              variant: "error",
-            })
-          })
+        void DialogPrompt.busy(
+          dialog,
+          "/btw",
+          question,
+          (active) =>
+            sdk.client.session
+              .ask({ sessionID, question })
+              .then((res) => {
+                if (!active()) return
+                return DialogAlert.show(dialog, "/btw", res.data?.answer ?? "(no answer)")
+              })
+              .catch((err) => {
+                if (!active()) return
+                dialog.clear()
+                toast.show({
+                  message: err instanceof Error ? err.message : "Failed to ask side question",
+                  variant: "error",
+                })
+              }),
+          { busyText: t("tui.command.session.ask.busy") },
+        )
     } else if (clientSlash) {
       clientSlash.onSelect?.()
     } else if (
@@ -1861,20 +1894,33 @@ export function Prompt(props: PromptProps) {
                       }
                     }
 
-                    const retryText = () => {
+                    // A rate-limit gets a clean, distinct label instead of the
+                    // raw provider message; other errors show the truncated
+                    // clean message. The attempt/countdown is a SEPARATE styled
+                    // status segment, not concatenated into the message string,
+                    // so it renders as structure rather than raw text. See T30.
+                    const isRateLimit = createMemo(() => {
+                      const r = retry()
+                      return r ? SessionRetry.isRateLimitMessage(r.message) : false
+                    })
+                    const label = createMemo(() => (isRateLimit() ? "Rate limited" : message()))
+                    const statusText = createMemo(() => {
                       const r = retry()
                       if (!r) return ""
-                      const baseMessage = message()
-                      const truncatedHint = isTruncated() ? " (click to expand)" : ""
                       const duration = formatDuration(seconds())
-                      const retryInfo = ` [retrying ${duration ? `in ${duration} ` : ""}attempt #${r.attempt}]`
-                      return baseMessage + truncatedHint + retryInfo
-                    }
+                      return `attempt #${r.attempt}${duration ? ` · retrying in ${duration}` : " · retrying"}`
+                    })
 
                     return (
                       <Show when={retry()}>
-                        <box onMouseUp={handleMessageClick}>
-                          <text fg={theme.error}>{retryText()}</text>
+                        <box flexDirection="row" gap={1} onMouseUp={handleMessageClick}>
+                          <text fg={isRateLimit() ? theme.warning : theme.error} attributes={TextAttributes.BOLD}>
+                            {label()}
+                          </text>
+                          <Show when={isTruncated()}>
+                            <text fg={theme.textMuted}>(click to expand)</text>
+                          </Show>
+                          <text fg={theme.textMuted}>{statusText()}</text>
                         </box>
                       </Show>
                     )

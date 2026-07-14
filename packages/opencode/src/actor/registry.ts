@@ -3,7 +3,8 @@ import { Database, inArray, eq, and, lte, sql } from "@/storage"
 import { Bus } from "@/bus"
 import type { SessionID, MessageID } from "@/session/schema"
 import { ActorRegistryTable } from "./actor.sql"
-import type { Actor, ActorStatus, ActorOutcome, ContextMode, Lifecycle, SpawnMode, ToolWhitelist } from "./schema"
+import type { Actor, ActorStatus, ActorOutcome, ContextMode, Lifecycle, SpawnMode, ToolWhitelist, Liveness } from "./schema"
+import { deriveLiveness } from "./schema"
 import * as Events from "./events"
 import { Log } from "@/util"
 import { SYSTEM_SPAWNED_AGENT_TYPES } from "@/agent/config"
@@ -68,6 +69,14 @@ export interface Interface {
   readonly updateTurn: (sessionID: SessionID, actorID: string) => Effect.Effect<void>
   readonly updateAgent: (sessionID: SessionID, actorID: string, agent: string) => Effect.Effect<void>
   readonly get: (sessionID: SessionID, actorID: string) => Effect.Effect<Actor | undefined>
+  // Derived pull-side liveness for a single actor row (progressing/stalled/
+  // terminal), computed from honest registry fields. Returns undefined when the
+  // row is absent. Pass stallMs to override the default staleness window.
+  readonly liveness: (
+    sessionID: SessionID,
+    actorID: string,
+    stallMs?: number,
+  ) => Effect.Effect<{ liveness: Liveness; actor: Actor } | undefined>
   readonly listBySession: (sessionID: SessionID) => Effect.Effect<Actor[]>
   readonly listActive: () => Effect.Effect<Actor[]>
   readonly listByParent: (sessionID: SessionID, parentActorID: string) => Effect.Effect<Actor[]>
@@ -241,6 +250,16 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
         ),
       )
       return row ? fromRow(row) : undefined
+    })
+
+    const liveness = Effect.fn("ActorRegistry.liveness")(function* (
+      sessionID: SessionID,
+      actorID: string,
+      stallMs?: number,
+    ) {
+      const actor = yield* get(sessionID, actorID)
+      if (!actor) return undefined
+      return { liveness: deriveLiveness(actor, Date.now(), stallMs), actor }
     })
 
     const listBySession = Effect.fn("ActorRegistry.listBySession")(function* (sessionID: SessionID) {
@@ -440,6 +459,7 @@ export const layer: Layer.Layer<Service, never, Bus.Service> = Layer.effect(
       updateTurn,
       updateAgent,
       get,
+      liveness,
       listBySession,
       listActive,
       listByParent,

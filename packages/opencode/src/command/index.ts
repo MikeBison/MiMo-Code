@@ -67,6 +67,7 @@ export const Default = {
   GOAL: "goal",
   DEEP_RESEARCH: "deep-research",
   LOOPS: "loops",
+  REBUILD: "rebuild",
 } as const
 
 export function deepResearchTemplate(): string {
@@ -170,6 +171,16 @@ export const layer = Layer.effect(
       commands[Default.GOAL] = {
         name: Default.GOAL,
         description: "set a stop-condition goal; runs until a judge says it's met. /goal clear to abort",
+        source: "command",
+        subtask: false,
+        get template() {
+          return "$ARGUMENTS"
+        },
+        hints: ["$ARGUMENTS"],
+      }
+      commands[Default.REBUILD] = {
+        name: Default.REBUILD,
+        description: "rebuild the conversation context now from the latest checkpoint (frees context; keeps recent messages)",
         source: "command",
         subtask: false,
         get template() {

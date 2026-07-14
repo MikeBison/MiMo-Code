@@ -28,7 +28,7 @@ describe("decideAskRouting", () => {
     expect(r.forward).toEqual({ parentSessionID: "ses_orchestrator" })
   })
 
-  test("compose subagent (background + mode:subagent) -> non-interactive, no forward", () => {
+  test("background subagent WITH parent (mode:subagent) -> non-interactive + inherit", () => {
     const r = decideAskRouting({
       askActor: { agent: "general", background: true, mode: "subagent" },
       sessionParentID: "ses_parent",
@@ -36,6 +36,18 @@ describe("decideAskRouting", () => {
     })
     expect(r.interactive).toBe(false)
     expect(r.forward).toBeUndefined()
+    expect(r.inherit).toEqual({ parentSessionID: "ses_parent" })
+  })
+
+  test("background subagent WITHOUT parent -> non-interactive, no inherit (auto-deny)", () => {
+    const r = decideAskRouting({
+      askActor: { agent: "general", background: true, mode: "subagent" },
+      sessionParentID: undefined,
+      agentName: "general",
+    })
+    expect(r.interactive).toBe(false)
+    expect(r.forward).toBeUndefined()
+    expect(r.inherit).toBeUndefined()
   })
 
   test("normal foreground (no actor, not system) -> interactive, no forward", () => {

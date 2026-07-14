@@ -29,6 +29,7 @@ import { ConfigAgent } from "./agent"
 import { ConfigCommand } from "./command"
 import { ConfigCompose } from "./compose"
 import { ConfigFormatter } from "./formatter"
+import { MIMOCODE_GITIGNORE_ENTRIES } from "./gitignore"
 import { ConfigHistory } from "./history"
 import { ConfigLayout } from "./layout"
 import { ConfigLSP } from "./lsp"
@@ -98,10 +99,6 @@ const InfoSchema = Schema.Struct({
     description: "JSON schema reference for configuration validation",
   }),
   logLevel: Schema.optional(LogLevelRef).annotate({ description: "Log level" }),
-  env: Schema.optional(Schema.Record(Schema.String, Schema.String)).annotate({
-    description:
-      "Environment variables to inject into the mimocode process and its child processes (e.g. the bash tool). A variable already set in the real environment takes precedence — config values only apply when the variable is not already set. Supports {env:VAR} and {file:path} substitution.",
-  }),
   server: Schema.optional(ConfigServer.Server).annotate({
     description: "Server configuration for mimo serve and web commands",
   }),
@@ -539,14 +536,6 @@ export const layer = Layer.effect(
     const env = yield* Env.Service
     const npmSvc = yield* Npm.Service
 
-    // Keys injected by config `env`, mapped to the process.env value that
-    // existed before we first touched them (undefined = was unset). Lives in
-    // the layer closure so it survives instance disposal / config reload,
-    // matching process.env's lifetime. Lets a reload distinguish "set by the
-    // real environment" (defer) from "set by our own prior injection"
-    // (re-apply edits, restore on removal).
-    const injectedEnv = new Map<string, string | undefined>()
-
     const readConfigFile = Effect.fnUntraced(function* (filepath: string) {
       return yield* fs.readFileString(filepath).pipe(
         Effect.catchIf(
@@ -652,7 +641,7 @@ export const layer = Layer.effect(
         yield* fs
           .writeFileString(
             gitignore,
-            ["node_modules", "package.json", "package-lock.json", "bun.lock", ".gitignore", ".cron-lock"].join("\n"),
+            MIMOCODE_GITIGNORE_ENTRIES.join("\n"),
           )
           .pipe(
             Effect.catchIf(
@@ -974,34 +963,6 @@ export const layer = Layer.effect(
         }
         if (Flag.MIMOCODE_DISABLE_PRUNE) {
           result.compaction = { ...result.compaction, prune: false }
-        }
-
-        const nextEnv = result.env ?? {}
-        // Reconcile keys we injected on a previous load that are no longer in
-        // config (removed/renamed): restore their original value so a config
-        // edit + reload takes effect without a process restart.
-        for (const [key, original] of injectedEnv) {
-          if (key in nextEnv) continue
-          if (original === undefined) {
-            delete process.env[key]
-            yield* env.remove(key)
-          } else {
-            process.env[key] = original
-            yield* env.set(key, original)
-          }
-          injectedEnv.delete(key)
-        }
-        for (const [key, value] of Object.entries(nextEnv)) {
-          // Defer to the real environment: only inject when the variable is
-          // not already set by something other than our own prior injection.
-          // A caller's runtime env (CI, container, `FOO=bar mimo`) is more
-          // specific than a persisted config default and must win. Matches
-          // Claude Code, where the settings field applies only when the env
-          // var is not set.
-          if (!injectedEnv.has(key) && process.env[key] !== undefined) continue
-          if (!injectedEnv.has(key)) injectedEnv.set(key, process.env[key])
-          process.env[key] = value
-          yield* env.set(key, value)
         }
 
         return {
