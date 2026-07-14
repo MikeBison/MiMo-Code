@@ -1469,19 +1469,34 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return tools // 返回 { 工具名: AITool } 字典,交给 runLoop 发给模型
     })
 
+    // ============================================================================
+    // handleSubtask：处理一个"预定的子任务"——手动派生一个子 agent 去干活,并管理它的
+    // 完整生命周期(建骨架 → 执行 → 成功/失败/取消三态 → 更新结果)。
+    //
+    // 何时触发:用户输入里 @了某 agent(如 "@explore 调研登录逻辑"),或斜杠命令配了 subtask,
+    // 会被解析成一个 subtask part。runLoop 检测到就调本函数。
+    //
+    // 与"模型自己调用 task 工具"的区别:subtask 是【预先就定好】的(用户明确指定了派谁),
+    // 不需要问模型"你想派谁",所以这里【手动伪造】出"模型如果调用了 task 工具本该产生的
+    // 那条助手消息 + 工具调用记录",然后直接执行。
+    //
+    // 类比前端:很像手动 dispatch 一个异步 action,并手写它的 loading/success/error 三态 UI。
+    // ============================================================================
     const handleSubtask = Effect.fn("SessionPrompt.handleSubtask")(function* (input: {
-      task: MessageV2.SubtaskPart
-      model: Provider.Model
-      lastUser: MessageV2.User
+      task: MessageV2.SubtaskPart      // 子任务描述:派哪个 agent、prompt、命令等
+      model: Provider.Model            // 当前模型(子任务没指定模型时用它兜底)
+      lastUser: MessageV2.User         // 触发这次子任务的用户消息
       sessionID: SessionID
       session: Session.Info
-      msgs: MessageV2.WithParts[]
+      msgs: MessageV2.WithParts[]      // 当前对话消息(传给子 agent 当上下文)
     }) {
       const { task, model, lastUser, sessionID, session, msgs } = input
       const ctx = yield* InstanceState.context
-      const promptOps = yield* ops()
-      const { actor: actorTool } = yield* registry.named()
+      const promptOps = yield* ops()                        // 暴露给子 agent 用的 prompt/cancel 能力
+      const { actor: actorTool } = yield* registry.named()  // 取出 task(actor)工具——真正派生子 agent 的执行体
+      // 子任务可指定自己的模型;没指定就用主流程的 model。
       const taskModel = task.model ? yield* getModel(task.model.providerID, task.model.modelID, sessionID) : model
+      // ── 块①(信封):建一条 assistant 消息,代表子 agent 这一 turn。记录 agent/model/时间等元信息。 ──
       const assistantMessage: MessageV2.Assistant = yield* sessions.updateMessage({
         id: MessageID.ascending(),
         role: "assistant",
@@ -1498,34 +1513,39 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         providerID: taskModel.providerID,
         time: { created: Date.now() },
       })
+      // 组装 task 工具的调用参数——就是"模型如果调 task 工具本该传的参数"。
       const taskArgs = {
         operation: {
           action: "run" as const,
           prompt: task.prompt,
           description: task.description,
-          subagent_type: task.agent,
+          subagent_type: task.agent,   // 派哪个子 agent
           command: task.command,
         },
       }
+      // ── 块①(内容块/loading骨架):在信封里放一个 tool part,初始状态 running。
+      // 先写这个骨架,TUI 订阅到就立刻显示"⏳ 正在跑子任务"(乐观更新)。用 let 因为后面要反复改它的状态。 ──
       let part: MessageV2.ToolPart = yield* sessions.updatePart({
         id: PartID.ascending(),
         messageID: assistantMessage.id,
         sessionID: assistantMessage.sessionID,
         type: "tool",
-        callID: ulid(),
-        tool: ActorTool.id,
+        callID: ulid(),                // 唯一且可按时间排序的调用 ID
+        tool: ActorTool.id,            // 就是 task 工具
         state: {
           status: "running",
           input: taskArgs,
           time: { start: Date.now() },
         },
       })
+      // ── 块②:执行前插件钩子(类比 axios 请求拦截器)。 ──
       yield* plugin.trigger(
         "tool.execute.before",
         { tool: ActorTool.id, sessionID, callID: part.id },
         { args: taskArgs },
       )
 
+      // ── 块③:校验——要派的这个子 agent 存在吗?不存在就发错误事件(UI 弹 toast)并抛错。 ──
       const taskAgent = yield* agents.get(task.agent)
       if (!taskAgent) {
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
@@ -1535,8 +1555,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         throw error
       }
 
-      let error: Error | undefined
-      const taskAbort = new AbortController()
+      // ── 块④(核心):真正派生并驱动子 agent 跑起来,并处理"成功/失败/取消"三种结局。 ──
+      let error: Error | undefined                 // 失败时把错误存这儿(见下方 catchCause)
+      const taskAbort = new AbortController()       // 前端老朋友:取消控制器,把"停止"信号传给子 agent
       const result = yield* actorTool
         .execute(taskArgs, {
           agent: task.agent,
@@ -1544,8 +1565,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           sessionID,
           abort: taskAbort.signal,
           callID: part.callID,
-          extra: { bypassAgentCheck: true, promptOps },
+          extra: { bypassAgentCheck: true, promptOps }, // bypassAgentCheck:用户明确指定的,跳过 agent 校验
           messages: msgs,
+          // metadata:子 agent 的"进度上报通道"。它执行中不断回调此函数,把最新状态写回 part,
+          // TUI 靠 part 变化实时刷新(如"explore 读到哪个文件了")。注意 part= 重新赋值,始终持有最新引用。
           metadata: (val: { title?: string; metadata?: Record<string, any> }) =>
             Effect.gen(function* () {
               part = yield* sessions.updatePart({
@@ -1554,6 +1577,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 state: { ...part.state, ...val },
               } satisfies MessageV2.ToolPart)
             }),
+          // ask:子 agent 要权限时走这里,ruleset 按子 agent 自己的权限算(不是主 agent 的)。
           ask: (req: any) =>
             permission
               .ask({
@@ -1564,12 +1588,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               .pipe(Effect.orDie),
         })
         .pipe(
+          // 结局B——失败(≈ try/catch 的 catch):记下错误、写日志,然后 return Effect.void"吞掉"错误,
+          // 不让它炸到主会话(result 会变成 undefined,后面靠"有没有 result"判断成败)。
+          // 降级而非上炸:一个子任务失败不该让整个会话崩,就像单张卡片加载失败不该白屏整页。
           Effect.catchCause((cause) => {
             const defect = Cause.squash(cause)
             error = defect instanceof Error ? defect : new Error(String(defect))
             log.error("subtask execution failed", { error, agent: task.agent, description: task.description })
             return Effect.void
           }),
+          // 结局C——被取消(≈ AbortController 触发时的清理):把信封标记完成、把内容块改成 error:"Cancelled",
+          // 避免留下永远转圈的僵尸态。
           Effect.onInterrupt(() =>
             Effect.gen(function* () {
               taskAbort.abort()
@@ -1592,6 +1621,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           ),
         )
 
+      // 给子 agent 返回的附件补齐身份字段(id/会话/消息),挂靠到这条消息上。
       const attachments = result?.attachments?.map((attachment) => ({
         ...attachment,
         id: PartID.ascending(),
@@ -1599,16 +1629,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         messageID: assistantMessage.id,
       }))
 
+      // ── 块⑤:执行后插件钩子(类比 axios 响应拦截器)。 ──
       yield* plugin.trigger(
         "tool.execute.after",
         { tool: ActorTool.id, sessionID, callID: part.id, args: taskArgs },
         result,
       )
 
+      // ── 块⑥:更新最终状态。先封"信封"——标记这条助手消息完成。 ──
       assistantMessage.finish = "tool-calls"
       assistantMessage.time.completed = Date.now()
       yield* sessions.updateMessage(assistantMessage)
 
+      // 成功分支:把内容块从 running → completed,填入子任务的输出/标题/附件。
       if (result && part.state.status === "running") {
         yield* sessions.updatePart({
           ...part,
@@ -1624,6 +1657,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         } satisfies MessageV2.ToolPart)
       }
 
+      // 失败分支:没有 result(被 catchCause 吞掉了),把内容块改成 error 状态。
       if (!result) {
         yield* sessions.updatePart({
           ...part,
@@ -1640,6 +1674,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         } satisfies MessageV2.ToolPart)
       }
 
+      // ── 块⑦(收尾):只对"命令触发"的子任务生效。追加一条隐藏的合成用户消息,
+      // 让主 agent 总结子任务输出并继续——这是子任务结果"回流"到主对话的方式。
+      // 不是命令触发的,到此结束。 ──
       if (!task.command) return
 
       const summaryUserMsg: MessageV2.User = {
@@ -1652,6 +1689,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         model: lastUser.model,
       }
       yield* sessions.updateMessage(summaryUserMsg)
+      // synthetic:true → 界面隐藏、模型可见的"纸条"。内容:总结上面子任务的输出并继续任务。
       yield* sessions.updatePart({
         id: PartID.ascending(),
         messageID: summaryUserMsg.id,
