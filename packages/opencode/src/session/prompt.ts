@@ -2013,16 +2013,26 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       return { info: msg, parts: [part] }
     })
 
+    // ============================================================================
+    // getModel：provider.getModel 的封装,核心价值是"模型找不到时给用户一条带建议的友好提示"。
+    // 它只是顺便发提示,不吞错误——该失败仍失败(最后原样重抛)。
+    // ============================================================================
     const getModel = Effect.fn("SessionPrompt.getModel")(function* (
       providerID: ProviderID,
       modelID: ModelID,
       sessionID: SessionID,
     ) {
+      // Effect.exit:把"可能失败的 Effect"捕获成一个 Exit 值(Success/Failure),不直接抛。
+      // 类比前端把 await fetch() 包进 try/catch,好让下面自己判断成败再决定怎么处理。
       const exit = yield* provider.getModel(providerID, modelID).pipe(Effect.exit)
-      if (Exit.isSuccess(exit)) return exit.value
+      if (Exit.isSuccess(exit)) return exit.value // 成功 → 直接返回模型
+      // 失败 → Cause.squash 把 Effect 复杂的错误原因"压扁"成一个普通 Error。
       const err = Cause.squash(exit.cause)
+      // 只对"模型没找到"这类特定错误做友好处理。
       if (Provider.ModelNotFoundError.isInstance(err)) {
+        // 若 provider 给了候选,拼一句 "Did you mean: xxx?"(比如敲错 gpt-4o → 提示 gpt-4o-mini)。
         const hint = err.data.suggestions?.length ? ` Did you mean: ${err.data.suggestions.join(", ")}?` : ""
+        // 发一个用户可见的错误事件(UI 弹 toast)。
         yield* bus.publish(Session.Event.Error, {
           sessionID,
           error: new NamedError.Unknown({
@@ -2030,23 +2040,47 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }).toObject(),
         })
       }
+      // 无论如何把原始错误重新抛出去——只负责"顺便提示",不负责"消化错误"。
       return yield* Effect.failCause(exit.cause)
     })
 
+    // ============================================================================
+    // lastModel：回答"这个会话上次用的是哪个模型",作为模型解析链的兜底。
+    // 用途:入参没指定、agent 也没指定模型时,延续会话上次用的模型,保持一致性。
+    // fnUntraced:不生成链路追踪 span——这是个高频廉价小查询,不值得单独记一条 trace。
+    // ============================================================================
     const lastModel = Effect.fnUntraced(function* (sessionID: SessionID) {
+      // 往回找最近一条"角色是 user 且带了 model 字段"的消息。agentID:"*" 表示跨所有 agent 切片找。
       const match = yield* sessions.findMessage(
         sessionID,
         (m) => m.info.role === "user" && !!m.info.model,
         { agentID: "*" },
       )
+      // Option 是 Effect 版的"可空值",isSome=有值。找到就用它的 model。
       if (Option.isSome(match) && match.value.info.role === "user") return match.value.info.model
+      // 没找到(如全新会话)→ 回退到系统默认模型。
       return yield* provider.defaultModel()
     })
 
+    // ============================================================================
+    // createUserMessage：把用户输入的一堆"轻量引用"(文本、@文件、@agent、data URL、
+    // MCP 资源等)【兑现】成一条完整的、能存库、能喂给模型的用户消息。
+    //
+    // 与 resolvePromptParts 的分工:resolvePromptParts 只"认出"每个 @xxx 是文件还是 agent;
+    // createUserMessage 才真正去【读文件、抓 MCP 资源、解码 data URL】,把引用变成实际内容。
+    // 类比前端:很像 GraphQL 的 resolver / 数据水合——把引用描述解析成真实数据。
+    //
+    // 流程:①解析 agent → ②解析 model+variant → ③构建消息头 info →
+    //       ④resolvePart 逐个兑现 part(核心) → ⑤并发跑+拍平+补 id → ⑥插件钩子 →
+    //       ⑦校验(只记日志不抛) → ⑧存库。
+    // ============================================================================
     const createUserMessage = Effect.fn("SessionPrompt.createUserMessage")(function* (input: PromptInput) {
+      // ── ①解析 agent:入参指定 → 否则用默认 agent。 ──
+      // 获取agent name
       const agentName = input.agent || (yield* agents.defaultAgent())
       const ag = yield* agents.get(agentName)
       if (!ag) {
+        // 找不到agent会列出可用的agent
         const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
         const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
         const error = new NamedError.Unknown({ message: `Agent not found: "${agentName}".${hint}` })
@@ -2054,24 +2088,34 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         throw error
       }
 
+      // ── ②解析 model + variant ──
+      // 输入方模型(调用方这次显式指定的;modelRef 是档位/分组名,需 resolveModelRef 解析成具体模型)
       const inputModel = input.modelRef
         ? yield* provider
             .resolveModelRef(input.modelRef)
             .pipe(Effect.map((m) => ({ providerID: m.providerID, modelID: m.id })))
         : input.model
+      // agent配置模型(这个 agent 默认用的模型)
       const agentModel = ag.modelRef
         ? yield* provider
             .resolveModelRef(ag.modelRef)
             .pipe(Effect.map((m) => ({ providerID: m.providerID, modelID: m.id })))
         : ag.model
+      // 三级优先级:调用方指定 ?? agent 配置 ?? 会话上次用的。
       const model = inputModel ?? agentModel ?? (yield* lastModel(input.sessionID))
+      // same:最终选中的模型是不是就等于 agent 配置的那个模型。variant(模型变体,如思考模式)
+      // 是绑在 agent 自己的模型上的——只有真用了 agent 的模型(same)时才考虑套用它,
+      // 若调用方覆盖了模型就不套(换了模型那 variant 无意义)。
       const same = agentModel && model.providerID === agentModel.providerID && model.modelID === agentModel.modelID
+      // full:取完整模型信息以查它支持哪些 variant(仅当需要判断 agent 的 variant 时才取)。
       const full =
         !input.variant && ag.variant && same
           ? yield* provider.getModel(model.providerID, model.modelID).pipe(Effect.catchDefect(() => Effect.void))
           : undefined
+      // 最终 variant:调用方显式指定优先;否则当 agent 配了 variant 且模型确实支持时才用。
       const variant = input.variant ?? (ag.variant && full?.variants?.[ag.variant] ? ag.variant : undefined)
 
+      // ── ③构建消息头 info(信封:role/agent/model/时间等元信息,不含具体内容)。 ──
       const info: MessageV2.User = {
         id: input.messageID ?? MessageID.ascending(),
         role: "user",
@@ -2090,18 +2134,25 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         provenance: input.provenance,
       }
 
+      // 作用域结束时清理这条消息相关的临时指令(配合函数末尾的 Effect.scoped)。
       yield* Effect.addFinalizer(() => instruction.clear(info.id))
 
+      // Draft<T>:"id 可选"版的 Part 类型(草稿阶段先不填 id)。分配式条件类型逐个成员处理,
+      // 保住判别联合的 type 与各自字段的对应关系(直接 Omit 整个联合会破坏它)。
       type Draft<T> = T extends MessageV2.Part ? Omit<T, "id"> & { id?: string } : never
+      // assign:给草稿 part 补 id——有就用(PartID.make),没有就生成递增 id(ascending 保证顺序)。
       const assign = (part: Draft<MessageV2.Part>): MessageV2.Part => ({
         ...part,
         id: part.id ? PartID.make(part.id) : PartID.ascending(),
       })
 
+      // ── ④resolvePart(核心):把"一个输入 part"兑现成"一个或多个真实 part"。
+      // 按 part 类型分支:file(MCP资源 / data URL / 本地文件·目录·二进制)、agent、默认透传。 ──
       const resolvePart: (part: PromptInput["parts"][number]) => Effect.Effect<Draft<MessageV2.Part>[]> = Effect.fn(
         "SessionPrompt.resolveUserPart",
       )(function* (part) {
         if (part.type === "file") {
+          // 分支A:file 来源是 MCP 资源 → 调 mcp.readResource 抓下来,展开成文本片段/二进制占位。
           if (part.source?.type === "resource") {
             const { clientName, uri } = part.source
             log.info("mcp resource", { clientName, uri, mime: part.mime })
@@ -2156,6 +2207,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
           const url = new URL(part.url)
           switch (url.protocol) {
+            // 分支B:data URL 内联数据。文本类型 → 解码出内容,并伪造成"调用了 Read 工具 + 返回内容"
+            // 的样子(下面 file 分支同理),让模型以为文件已读好,省一次 read 往返。
             case "data:":
               if (part.mime === "text/plain") {
                 return [
@@ -2177,11 +2230,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 ]
               }
               break
+            // 分支C:本地文件(@文件)。真正调 read 工具读它,并伪造成"read 工具调用+结果",
+            // 让模型直接拿到内容,省一次往返;复用真正的 read 工具保证与模型自己读时行为一致。
             case "file:": {
               log.info("file", { mime: part.mime })
               const filepath = fileURLToPath(part.url)
               if (yield* fsys.isDir(filepath)) part.mime = "application/x-directory"
 
+              // execRead:用真正的 read 工具读文件的小封装(bypassCwdCheck 放宽目录限制,因用户明确指定)。
               const { read } = yield* registry.named()
               const execRead = (args: Parameters<typeof read.execute>[0], extra?: Tool.Context["extra"]) => {
                 const controller = new AbortController()
@@ -2199,6 +2255,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   .pipe(Effect.onInterrupt(() => Effect.sync(() => controller.abort())))
               }
 
+              // C-1:文本文件。支持行范围(URL 的 ?start=&end= 参数)。
               if (part.mime === "text/plain") {
                 let offset: number | undefined
                 let limit: number | undefined
@@ -2207,6 +2264,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   const filePathURI = part.url.split("?")[0]
                   let start = parseInt(range.start)
                   let end = range.end ? parseInt(range.end) : undefined
+                  // LSP 加持:若 start===end(只点了一行),查这行是不是某符号(函数/类)的定义,
+                  // 是的话自动扩展到整个符号范围(@file 点在函数名上 → 读整个函数)。
                   if (start === end) {
                     const symbols = yield* lsp.documentSymbol(filePathURI).pipe(Effect.catch(() => Effect.succeed([])))
                     for (const symbol of symbols) {
@@ -2278,6 +2337,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 return pieces
               }
 
+              // C-2:目录。read 工具读出目录列表。
               if (part.mime === "application/x-directory") {
                 const args = { file_path: filepath }
                 const exit = yield* execRead(args).pipe(Effect.exit)
@@ -2318,6 +2378,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 ]
               }
 
+              // C-3:其它(二进制,如图片)。读文件 → base64 编码成 data URL 的 file part
+              // (模型上下文吃不下原始字节,只能走编码后的 data URL,见二进制/base64 那节)。
               return [
                 {
                   messageID: info.id,
@@ -2343,7 +2405,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           }
         }
 
+        // 分支D:@agent。展开成"agent 引用本身 + 一条合成指令(叫模型去调 actor 工具派这个子 agent)"。
         if (part.type === "agent") {
+          // 若权限上该 agent 是 deny 的,但用户明确 @了它 → 加一句"用户指定的,保证存在"以绕过(用户优先级最高)。
           const perm = Permission.evaluate("task", part.name, ag.permission)
           const hint = perm.action === "deny" ? " . Invoked by user; guaranteed to exist." : ""
           return [
@@ -2361,13 +2425,17 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           ]
         }
 
+        // 分支E(默认):纯文本等,原样透传,不加工。
         return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
       })
 
+      // ── ⑤对所有输入 part 并发跑 resolvePart(多个文件同时读)→ 拍平(一个 part 可能兑现成多个)→
+      // 逐个 assign 补 id。 ──
       const parts = yield* Effect.forEach(input.parts, resolvePart, { concurrency: "unbounded" }).pipe(
         Effect.map((x) => x.flat().map(assign)),
       )
 
+      // ── ⑥插件钩子 chat.message:让插件在消息落库前介入。 ──
       yield* plugin.trigger(
         "chat.message",
         {
@@ -2380,6 +2448,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         { message: info, parts },
       )
 
+      // ── ⑦校验:safeParse 校验消息头和每个 part。注意——失败只 log.error 记日志、【不抛错】,
+      // 防御性:即便某个 part 格式有问题,也尽量把能存的存进去,不让整条消息崩掉。 ──
       const parsed = MessageV2.Info.safeParse(info)
       if (!parsed.success) {
         log.error("invalid user message before save", {
@@ -2404,14 +2474,33 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         })
       })
 
+      // ── ⑧存库:先存信封(消息头),再逐个存 part。 ──
       yield* sessions.updateMessage(info)
       for (const part of parts) yield* sessions.updatePart(part)
 
       return { info, parts }
+      // Effect.scoped:让上面 addFinalizer 注册的清理(instruction.clear)在此作用域结束时执行。
     }, Effect.scoped)
 
+    // ============================================================================
+    // sweepOrphanAssistants：清理"孤儿助手消息"——因硬中断(进程崩溃/被 kill/断连)导致
+    // 正常 finish 收尾没跑、永远停在"进行中"(有 created 无 completed)的残留消息。
+    //
+    // 危害:TUI 靠"最新的未完成助手消息"判断会话是否在忙,陈旧孤儿会让新发的每条消息
+    // 假性卡成 QUEUED(最长 1 小时)。所以这里给孤儿强制收尾:补 completed 时间 + 标记 AbortedError。
+    //
+    // 核心两难:"未完成" ≠ "孤儿"——它也可能是正在重试的在途请求。双策略区分(见 immediate):
+    //   · 不确定会话忙不忙 → 用【时间守卫】(等够 ORPHAN_AGE_MS 才敢清)
+    //   · 确定会话空闲(idle) → 用【状态判断】(空闲还挂着未完成的必是孤儿,立即清)
+    //
+    // 类比前端:进页面时重置"僵尸 loading"(请求中途崩了,finally 没跑,loading 永远 true)。
+    // ============================================================================
     const sweepOrphanAssistants = Effect.fn("SessionPrompt.sweepOrphanAssistants")(function* (
       sessionID: SessionID,
+      // immediate=true 时,不看年龄,直接清所有未完成助手消息。调用方在"会话空闲(无活跃 runner)"时
+      // 传 true——此时任何未完成的助手消息都必是硬中断留下的真孤儿,而非在途重试。立即清很重要,
+      // 否则新消息会被那个假性 QUEUED 挡住(最长 ORPHAN_AGE_MS=1 小时)。默认 false,让后台调用方
+      // (spawn/hook)保留年龄守卫。
       // When true, sweep dangling assistants regardless of age. The caller sets
       // this when the session is idle (no active runner), meaning any assistant
       // without time.completed is definitively orphaned — left behind by a hard
@@ -2424,7 +2513,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       // false so background callers (spawn/hook) keep the age guard.
       immediate = false,
     ) {
-      const msgs = yield* sessions.messages({ sessionID, agentID: "*" })
+      const msgs = yield* sessions.messages({ sessionID, agentID: "*" }) // 取会话所有消息(跨所有 agent 切片,孤儿可能属于子 agent)
       const now = Date.now()
       // 1 小时——必须超过 Task 1 的 chunkMs（300s）加上 Task 2 的
       // PERSISTENT_RETRY 最坏情况退避（10 次尝试 × 5 分钟上限 =
@@ -2432,16 +2521,19 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       // 正取得进展时被错误清扫。
       const ORPHAN_AGE_MS = 3_600_000
       for (const m of msgs) {
-        if (m.info.role !== "assistant") continue
-        if (m.info.time?.completed) continue
+        if (m.info.role !== "assistant") continue          // 只处理助手消息
+        if (m.info.time?.completed) continue                // 已完成的不是孤儿,跳过
         const created = m.info.time?.created ?? 0
+        // 年龄守卫:非 immediate 模式下,只清"超过 1 小时还没完成的",避免误杀在途重试请求。
         if (!immediate && now - created < ORPHAN_AGE_MS) continue
+        // 强制收尾:补完成时间 + 标记中止错误(本来就有错就保留),让界面显示"被中断"而非无声无息。
         m.info.time = { ...m.info.time, completed: now }
         m.info.error =
           m.info.error ??
           new MessageV2.AbortedError({
             message: "Abandoned: previous request interrupted before completion",
           }).toObject()
+        // 存库。失败只记 warn 不抛错——清理是"尽力而为"的维护动作,单条失败不该拖垮流程(防御性)。
         yield* sessions.updateMessage(m.info).pipe(
           Effect.catchCause((cause) =>
             elog.warn("orphan-update-failed", {
