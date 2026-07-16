@@ -7,7 +7,7 @@ Alternate implementation notes:
       doesn't ship the rest of the toolkit.
 
 Usage:
-    python render_pdf.py <input.docx> [--out-dir out/]
+    uv run render_pdf.py <input.docx> [--out-dir out/]
 """
 from __future__ import annotations
 

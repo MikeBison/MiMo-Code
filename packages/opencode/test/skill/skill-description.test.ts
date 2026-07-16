@@ -1,5 +1,12 @@
 import { describe, test, expect } from "bun:test"
 import { skillDescription } from "../../src/cli/cmd/tui/i18n/skill"
+import { dict as en } from "../../src/cli/cmd/tui/i18n/en"
+import { dict as es } from "../../src/cli/cmd/tui/i18n/es"
+import { dict as fr } from "../../src/cli/cmd/tui/i18n/fr"
+import { dict as ja } from "../../src/cli/cmd/tui/i18n/ja"
+import { dict as ru } from "../../src/cli/cmd/tui/i18n/ru"
+import { dict as zh } from "../../src/cli/cmd/tui/i18n/zh"
+import { dict as zht } from "../../src/cli/cmd/tui/i18n/zht"
 
 describe("skillDescription", () => {
   const t = (key: string) => {
@@ -32,5 +39,12 @@ describe("skillDescription", () => {
 
   test("user override: same name as builtin but not bundled shows fallback", () => {
     expect(skillDescription(t, "evolve", "User custom evolve", false)).toBe("User custom evolve")
+  })
+
+  test("codex CLI skills have descriptions in every TUI locale", () => {
+    for (const dict of [en, es, fr, ja, ru, zh, zht]) {
+      expect(dict["tui.skill.codex.description"]).toBeTruthy()
+      expect(dict["tui.skill.claude-code.description"]).toBeTruthy()
+    }
   })
 })

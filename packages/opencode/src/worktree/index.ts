@@ -409,6 +409,8 @@ export const layer: Layer.Layer<
         throw new RemoveFailedError({ message: list.stderr || list.text || "Failed to read git worktrees" })
       }
 
+      yield* Effect.promise(() => Instance.disposeDirectory(input.directory))
+
       const entries = parseWorktreeList(list.text)
       const entry = yield* locateWorktree(entries, directory)
 

@@ -1,6 +1,5 @@
 import {
   newQuickJSWASMModuleFromVariant,
-  shouldInterruptAfterDeadline,
   type QuickJSContext,
   type QuickJSDeferredPromise,
   type QuickJSHandle,
@@ -28,6 +27,18 @@ export type SandboxOptions = {
    * runtime passes a hash of runID so resume gets the same seed naturally;
    * tests / one-off callers that don't care can omit this. */
   seed?: number
+  /** Default true: strip Date/Math.random/WeakRef for resume-replay determinism
+   * (the workflow contract). Pass false for single-shot callers (tool_script)
+   * that have no replay requirement and want the standard JS environment. */
+  deterministic?: boolean
+  /** Optional ACTIVE-time budget: counts only time when NO host hook promise is
+   * pending, so a guest parked on a slow tool call is not charged. Kills runaway
+   * synchronous guest code via the interrupt handler. Wall-clock `deadlineMs`
+   * remains the overall kill-switch for hangs. */
+  activeDeadlineMs?: number
+  /** Optional cooperative cancel: polled from the interrupt handler (guest
+   * bytecode) so an aborted caller can stop a busy guest promptly. */
+  interrupt?: () => boolean
 }
 
 const DEFAULT_DEADLINE_MS = 12 * 60 * 60 * 1000
@@ -84,7 +95,35 @@ export async function evalScript(body: string, hooks: Record<string, HostFn>, op
   const QuickJS = await newQuickJSWASMModuleFromVariant(singlefileVariant)
   const rt = QuickJS.newRuntime()
   rt.setMemoryLimit(opts.memoryLimitBytes ?? DEFAULT_MEMORY)
-  rt.setInterruptHandler(shouldInterruptAfterDeadline(Date.now() + (opts.deadlineMs ?? DEFAULT_DEADLINE_MS)))
+  // Active-time accounting: charge the guest only while no host hook promise is
+  // pending. `pending` transitions drive a pause/resume clock; the interrupt
+  // handler (fires only during guest bytecode execution) compares accumulated
+  // active time against the budget. Wall-clock deadline still backstops hangs.
+  const activeBudget = opts.activeDeadlineMs
+  let pending = 0
+  let activeStart = Date.now()
+  let activeAccum = 0
+  const hostCallTracker =
+    activeBudget === undefined
+      ? undefined
+      : {
+          start: () => {
+            pending++
+            if (pending === 1) activeAccum += Date.now() - activeStart
+          },
+          end: () => {
+            pending--
+            if (pending === 0) activeStart = Date.now()
+          },
+        }
+  const wallDeadline = Date.now() + (opts.deadlineMs ?? DEFAULT_DEADLINE_MS)
+  rt.setInterruptHandler(() => {
+    if (opts.interrupt?.()) return true
+    if (Date.now() > wallDeadline) return true
+    if (activeBudget === undefined) return false
+    const active = activeAccum + (pending === 0 ? Date.now() - activeStart : 0)
+    return active > activeBudget
+  })
   const vm = rt.newContext()
 
   // Arena: every handle we create goes here and is disposed in `finally`.
@@ -99,7 +138,7 @@ export async function evalScript(body: string, hooks: Record<string, HostFn>, op
   }
 
   try {
-    injectHooks(vm, hooks, track, deferreds)
+    injectHooks(vm, hooks, track, deferreds, hostCallTracker)
     // Determinism: the guest is a bare quickjs-emscripten JS engine — no Web/Node
     // APIs exist (no crypto/performance/fetch/timers/process/Temporal/gc; all
     // already undefined). We neutralize the JS built-ins whose output or timing is
@@ -114,8 +153,11 @@ export async function evalScript(body: string, hooks: Record<string, HostFn>, op
     //     is only used by tests/one-off callers that don't pass a seed.
     //   - WeakRef / FinalizationRegistry — deleted (expose GC liveness/callback
     //     scheduling, which differs across runs and would silently diverge on replay).
-    const seed = (opts.seed ?? DEFAULT_PRNG_SEED) >>> 0
-    const strip = vm.evalCode(`
+    // Skipped entirely when deterministic === false (single-shot callers with no
+    // replay contract keep the stock JS environment: real Date, real Math.random).
+    if (opts.deterministic !== false) {
+      const seed = (opts.seed ?? DEFAULT_PRNG_SEED) >>> 0
+      const strip = vm.evalCode(`
       delete globalThis.Date;
       (function () {
         // mulberry32 — tiny seeded PRNG; deterministic for a given seed.
@@ -131,10 +173,11 @@ export async function evalScript(body: string, hooks: Record<string, HostFn>, op
       delete globalThis.WeakRef;
       delete globalThis.FinalizationRegistry;
     `)
-    if (strip.error) {
-      strip.error.dispose()
-    } else {
-      strip.value.dispose()
+      if (strip.error) {
+        strip.error.dispose()
+      } else {
+        strip.value.dispose()
+      }
     }
     const pre = vm.evalCode(PRELUDE)
     if (pre.error) {
@@ -233,6 +276,7 @@ function injectHooks(
   hooks: Record<string, HostFn>,
   track: <H extends QuickJSHandle>(h: H) => H,
   deferreds: QuickJSDeferredPromise[],
+  hostCallTracker?: { start: () => void; end: () => void },
 ): void {
   for (const [name, fn] of Object.entries(hooks)) {
     const fnHandle = vm.newFunction(name, (...argHandles) => {
@@ -241,8 +285,10 @@ function injectHooks(
       if (out instanceof Promise) {
         const promise = vm.newPromise()
         deferreds.push(promise)
+        hostCallTracker?.start()
         out.then(
           (value) => {
+            hostCallTracker?.end()
             // A late settle may arrive after the context is disposed (script
             // returned without awaiting). Bail before touching a dead context.
             if (!vm.alive) return
@@ -252,6 +298,7 @@ function injectHooks(
             vm.runtime.executePendingJobs()
           },
           (err) => {
+            hostCallTracker?.end()
             if (!vm.alive) return
             const eh = vm.newString(err instanceof Error ? err.message : String(err))
             promise.reject(eh)

@@ -272,6 +272,24 @@ export const Event = {
       nextDelayMs: z.number().int().nonnegative(),
     }),
   ),
+  TryBestDetected: BusEvent.define(
+    "session.try_best.detected",
+    z.object({
+      sessionID: SessionID.zod,
+      agentID: z.string().optional(),
+      providerID: z.string(),
+      modelID: z.string(),
+      reason: z.enum(["edit_repeat", "bash_retry", "action_streak"]),
+      evidence: z.object({
+        tool: z.string(),
+        path: z.string().optional(),
+        command: z.string().optional(),
+        count: z.number().int().positive(),
+        similarity: z.number().min(0).max(1).optional(),
+        action: z.enum(["edit", "verify"]).optional(),
+      }),
+    }),
+  ),
 }
 
 export function plan(input: { slug: string; time: { created: number } }) {

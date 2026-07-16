@@ -146,6 +146,10 @@ export const Flag = {
   MIMOCODE_SERVER_USERNAME: process.env["MIMOCODE_SERVER_USERNAME"],
   MIMOCODE_ENABLE_QUESTION_TOOL: truthy("MIMOCODE_ENABLE_QUESTION_TOOL"),
 
+  // Defaults to true. Set MIMOCODE_ENABLE_TRY_BEST_HANDOFF=false (or 0) to
+  // disable try-best loop detection, automatic turn pausing, and handoff UI.
+  MIMOCODE_ENABLE_TRY_BEST_HANDOFF: !falsy("MIMOCODE_ENABLE_TRY_BEST_HANDOFF"),
+
   // Defaults to false. The edit tool does pure exact-string matching with
   // explicit error signals. Set MIMOCODE_ENABLE_FUZZY_EDIT=true to opt into the
   // legacy multi-stage fuzzy fallback chain (line-trimmed / block-anchor /

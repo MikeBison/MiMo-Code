@@ -161,8 +161,10 @@ uv run scripts/insert_slide.py unpacked/ --blank-from slideLayout5.xml
 uv run scripts/diagnose.py output.pptx
 ```
 
-Every script is a small, self-contained Python file. Read the top of the file
-for its full CLI options.
+Every script is a small Python CLI. Some scripts (e.g. `render_pdf.py`,
+`render_slides.py`, `contact_sheet.py`) import from a shared helper
+(`soffice_bridge.py`) in the same directory — copy them together. Read the top
+of each file for its full CLI options.
 
 ## Live preview
 
@@ -393,7 +395,8 @@ isn't, inform the user and offer to spawn a vision subagent instead.
 - **Reading / extracting**: [`read.md`](read.md) — plain-text export
   (including speaker notes), structural walk, metadata, thumbnails, image
   extraction, conversion to PDF / PNG for QA.
-- **Scripts**: [`scripts/`](scripts/) — self-contained CLI utilities.
+- **Scripts**: [`scripts/`](scripts/) — CLI utilities (some share a local
+  `soffice_bridge.py` helper; copy together when extracting).
 - **Live preview**: [`scripts/preview.ts`](scripts/preview.ts) — launcher
   (start/stop); [`scripts/preview_server.ts`](scripts/preview_server.ts) —
   background server that watches .pptx, converts to PDF, serves with

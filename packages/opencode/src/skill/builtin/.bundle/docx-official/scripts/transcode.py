@@ -10,8 +10,8 @@ Alternate implementation notes:
       knows how to write.
 
 Usage:
-    python transcode.py <input> --to pdf
-    python transcode.py <input> --to png --dpi 200 --out-dir out/
+    uv run transcode.py <input> --to pdf
+    uv run transcode.py <input> --to png --dpi 200 --out-dir out/
 """
 from __future__ import annotations
 

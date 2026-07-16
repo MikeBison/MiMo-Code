@@ -290,6 +290,8 @@ export const dict = {
   "tui.skill.skill-creator.description": "Crea, revisa y mejora skills de agente",
   "tui.skill.drive-mimo.description": "Controla programáticamente otro proceso MiMoCode — eventos JSON headless o TUI interactiva vía tmux",
   "tui.skill.research-paper-writing.description": "Redacta, pule y critica artículos académicos con perspectiva de revisor",
+  "tui.skill.codex.description": "Ejecuta Codex CLI de forma autónoma en scripts, CI, Docker y Kubernetes",
+  "tui.skill.claude-code.description": "Delega tareas de programación a Claude Code CLI",
   "tui.skill.design-blueprint.description":
     "Producir un plano de diseño (DESIGN.md + Decision Trace) antes de crear cualquier mockup",
   "tui.skill.super-research.description":
@@ -351,6 +353,8 @@ export const dict = {
   "tui.command.variant.cycle.title": "Ciclo de variantes",
   "tui.command.variant.list.title": "Cambiar variante de modelo",
   "tui.command.agent.cycle.reverse.title": "Ciclo de agentes (inverso)",
+  "tui.agent.locked": "No se puede cambiar de modo después de entrar en modo {{mode}}",
+  "tui.agent.locked.subset": "En esta sesión, solo puede cambiar entre {{agents}}",
   "tui.command.provider.login.title": "Iniciar sesión",
   "tui.command.provider.connect.title": "Conectar proveedor",
   "tui.command.provider.logout.title": "Cerrar sesión",
@@ -407,6 +411,24 @@ export const dict = {
   "tui.dialog.export.hint.confirm_action": "para confirmar",
   "tui.dialog.export.hint.options_action": "para opciones",
   "tui.toast.copied_to_clipboard": "Copiado al portapapeles",
+  "tui.toast.try_best.paused_other": "Se detectó un bucle try-best; la sesión {{session}} se ha pausado.",
+  "tui.toast.try_best.handoff_failed": "No se pudo iniciar la transferencia al entorno seleccionado.",
+  "tui.toast.try_best.continue_failed": "No se pudo continuar la sesión",
+  "tui.dialog.try_best.title": "Bucle try-best detectado — turno pausado",
+  "tui.dialog.try_best.reason.edit_repeat": "Se repitieron ediciones casi idénticas {{count}} veces.",
+  "tui.dialog.try_best.reason.edit_repeat_path":
+    "Se repitieron ediciones casi idénticas {{count}} veces en {{path}}.",
+  "tui.dialog.try_best.reason.bash_retry":
+    "El mismo comando fallido se reintentó {{count}} veces sin una edición correcta.",
+  "tui.dialog.try_best.reason.action_streak":
+    "{{count}} acciones consecutivas de {{action}} no produjeron ningún progreso observable.",
+  "tui.dialog.try_best.action.edit": "edición",
+  "tui.dialog.try_best.action.verify": "verificación",
+  "tui.dialog.try_best.action.same_kind": "la misma clase",
+  "tui.dialog.try_best.handoff.title": "Transferir a {{target}}",
+  "tui.dialog.try_best.handoff.description": "Pedir a MiMo que delegue el trabajo pendiente en este entorno",
+  "tui.dialog.try_best.continue.title": "Continuar con {{model}}",
+  "tui.dialog.try_best.continue.description": "Pedir al modelo actual que abandone este enfoque y vuelva a planificar",
   "tui.toast.instructions_loaded": "Cargado {{files}}",
   "tui.toast.update_available.title": "Actualización disponible",
   "tui.toast.update_available.confirm": "La nueva versión v{{version}} está disponible. ¿Desea actualizar ahora?",

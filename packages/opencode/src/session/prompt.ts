@@ -61,7 +61,6 @@ import {
   EMPTY_STEP_RECOVERY_REPLAN,
   isEmptyStep,
 } from "../session/prompt/empty-step-detection"
-import { composeSkillsBlock } from "@/skill/compose/extract"
 import { builtinSkillRoot, matchDocumentSkills } from "@/skill/builtin/extract"
 import { ToolRegistry } from "../tool"
 import { MCP } from "../mcp"
@@ -106,8 +105,6 @@ import { InstanceState } from "@/effect"
 import { ActorTool, type ActorPromptOps } from "@/tool/actor"
 import { SessionRunState } from "./run-state"
 import { Goal } from "./goal"
-import { TaskGate, MAX_TASK_GATE_MAIN_REACT } from "@/task/gate"
-import { TaskGateState } from "@/task/gate-state"
 import { TaskRegistry } from "@/task/registry"
 import { EffectBridge } from "@/effect"
 import { Team } from "@/team"
@@ -302,8 +299,6 @@ export const layer = Layer.effect(
     const instruction = yield* Instruction.Service      // 指令:加载项目级 instructions(AGENTS.md 等)
     const state = yield* SessionRunState.Service        // 运行态:记录/取消会话当前的运行循环
     const goal = yield* Goal.Service                    // 目标:/goal 停止条件与裁判判定
-    const taskGateState = yield* TaskGateState.Service  // 任务闸:控制任务执行的门控状态
-    const taskRegistry = yield* TaskRegistry.Service    // 任务注册表:任务树(T1/T1.1…)的增删查改
     const revert = yield* SessionRevert.Service         // 回退:撤销某轮改动
     const summary = yield* SessionSummary.Service       // 摘要:生成会话/消息摘要
     const sys = yield* SystemPrompt.Service             // 系统提示:拼装 system prompt(环境、技能等)
@@ -753,7 +748,6 @@ export const layer = Layer.effect(
         (msg) => msg.info.role === "user" && msg.info.agent === "compose",
       )
       if (composeModeMsg) {
-        const composeModeBlock = composeSkillsBlock()
         const ctx = yield* InstanceState.context
         const composeCfg = (yield* config.get()).compose
         const docsDir = ConfigCompose.resolveDocsDir(ctx.worktree, composeCfg)
@@ -764,7 +758,6 @@ export const layer = Layer.effect(
         //     "保存 compose 技能的产物：规格(specs)存到 `.../specs`、
         //      计划(plans)存到 `.../plans`、报告(reports)存到 `.../reports`。"
         const text = PROMPT_COMPOSE
-          .replace("{{compose_skills}}", composeModeBlock)
           .replace("{{compose_docs_dir}}", `Save compose skill outputs: specs in \`${path.join(docsDir, "specs")}\`, plans in \`${path.join(docsDir, "plans")}\`, reports in \`${path.join(docsDir, "reports")}\`.`)
         composeModeMsg.parts.unshift({
           id: PartID.ascending(),
@@ -2645,7 +2638,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         let emptyStepStreak = 0
         // Set true when a guard hard-halts the turn (currently the empty-step
         // guard). A hard halt is terminal: it must break out immediately and
-        // NOT be re-entered by the taskGate / goalGate ReAct gates, which would
+        // NOT be re-entered by the goalGate ReAct gate, which would
         // otherwise inject a fresh user turn and re-drive a still-degraded model
         // into the same loop.
         let hardHalt = false
@@ -2654,6 +2647,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         // 使 session.post 报告 outcome="cancelled" 而非 "error"。
         let cancelled = false
         let cancelReason: string | undefined
+        let lastSystemPrompt: string[] | undefined = undefined
 
         // 通过下面主体上的 Effect.onExit 恰好触发一次 session.post。
         // 没有这层包裹，while 循环内任何被 yield 出来的失败（provider 错误、
@@ -2698,6 +2692,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 finalText: finalAsst ? assistantFinalText(finalAsst, finalParts) : undefined,
                 assistantMessageID: finalAsst?.id,
                 trajectory: serializeTrajectoryMessages(sliceMsgs),
+                systemPrompt: lastSystemPrompt,
               },
               {},
             )
@@ -2798,73 +2793,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               "Do not restart, recap, or repeat prior reasoning. Keep reasoning concise, prefer concrete tool calls or final output, and only stop when the user's task is complete or genuinely blocked.",
               "</system-reminder>",
             ].join("\n"),
-          } satisfies MessageV2.TextPart)
-          return true
-        })
-
-        // 任务停止条件闸门（仅主 agent）。在允许停止之前，列出会话里未终结的任务：
-        // 如果还有剩余，就以合成用户 turn 的形式注入一条提示并重入（返回 true），
-        // 让模型用 `task done` / `task abandon` 把它们收尾。ReAct 上限 + 计数器
-        // 与 goal 闸门相同；超过上限则允许停止并记一条 warn 日志（主 agent 上无
-        // reportedStatus）。owner=undefined 会接手那些被达到自身上限的子 agent 闸门
-        // 遗弃的任务。在 goalGate *之前*运行，因为任务状态更容易结算，而一块待办任务
-        // 板会污染任何 goal 裁决。
-        const taskGate = Effect.fn("SessionPrompt.taskGate")(function* (lastUser: MessageV2.User) {
-          if ((agentID ?? "main") !== "main") return false
-          // 如果主 agent 的 `task` 工具被剥离了（Permission.disabled），那么提示它去
-          // 调用 `task done` 是无法满足的，并且会一直重入直到达到上限。此时完全跳过
-          // 闸门。这与 actor/spawn.ts 里的 canWrite 跳过（对 forkAgentInfo 做
-          // Permission.disabled(["write"], ...) 检查）相对应。按会话解析意味着这里
-          // 只检查 agent 的静态权限（对 v1 足够；会话级覆盖在被拒绝的 agent 上重新
-          // 启用 task 属于病态情况，超出范围）。
-          const mainAgent = yield* agents.get("main").pipe(Effect.orElseSucceed(() => undefined))
-          if (mainAgent && Permission.disabled(["task"], mainAgent.permission).has("task")) return false
-          // 按消息的 `tools` 是第二层工具剥离（llm.ts:720 的
-          // `input.user.tools?.[k] !== false` 过滤），独立于 Permission.disabled。
-          // 一个为其 turn 固定了狭窄工具集的斜杠命令，可能在权限允许的情况下仍丢掉
-          // `task`；此时提示就无法满足。跳过理由相同，只是作用窗口更窄。
-          if (lastUser.tools?.["task"] === false) return false
-
-          const count = yield* taskGateState.get(sessionID)
-          // runLoop 被标注为 `R = never`；TaskGate.decide 会引入一个
-          // TaskRegistry.Service 依赖需求，我们在本地用已由 layer 解析的绑定把它闭合，
-          // 使其不会泄漏进 runLoop 的 R 集合。
-          const decision = yield* TaskGate.decide({
-            session_id: sessionID,
-            owner: undefined,
-            reactCount: count,
-            maxReact: MAX_TASK_GATE_MAIN_REACT,
-            mode: "main",
-          }).pipe(Effect.provideService(TaskRegistry.Service, taskRegistry))
-          if (!decision.needReentry) {
-            if (decision.capExceeded) {
-              yield* slog.warn("task gate hit cap; allowing stop", {
-                sessionID,
-                incompleteTasks: decision.incompleteTasks,
-              })
-            }
-            yield* taskGateState.clear(sessionID)
-            return false
-          }
-          yield* taskGateState.bump(sessionID)
-          const reentry = yield* sessions.updateMessage({
-            id: MessageID.ascending(),
-            role: "user" as const,
-            sessionID,
-            agentID: lastUser.agentID,
-            agent: lastUser.agent,
-            model: lastUser.model,
-            tools: lastUser.tools,
-            format: lastUser.format,
-            time: { created: Date.now() },
-          })
-          yield* sessions.updatePart({
-            id: PartID.ascending(),
-            messageID: reentry.id,
-            sessionID,
-            type: "text",
-            synthetic: true,
-            text: decision.reentryText,
           } satisfies MessageV2.TextPart)
           return true
         })
@@ -3317,7 +3245,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         // ║   5) 溢出检查：主 agent 走 checkpoint 重建、子 agent/回退走 compaction       ║
         // ║   6) 建空助手消息 → 调模型（fork 用冻结快照 / 主用现算前缀）→ 得 result     ║
         // ║   7) 过一连串「控制闸门」把 result 归纳成 outcome（"break" | "continue"）    ║
-        // ║   8) outcome==="break" 时仍要过 taskGate / goalGate，可被否决而强制 continue ║
+        // ║   8) outcome==="break" 时仍要过 goalGate，可被否决而强制 continue           ║
         // ║ 循环外收尾：后台 prune → 取 final → 发指标 → 唤醒型 peer 通知父级 → return   ║
         // ║ 整段被 Effect.onExit(firePostSession) 包裹：无论成功/失败/中断都触发         ║
         // ║ session.post 钩子（try/finally 语义）。                                     ║
@@ -3336,7 +3264,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         // ║ • 上下文溢出               : 主 agent→checkpoint 重建；子 agent→compaction   ║
         // ║ • compaction 边界标记      : 路由到 compaction.process，非 stop 则 continue  ║
         // ║ • subtask 派生             : handleSubtask 后 continue                      ║
-        // ║ *• taskGate 否决 break     : 模型想停但仍有未完成 task → 逼继续              ║
         // ║ *• goalGate 否决 break     : 裁判模型判定用户目标未达成 → 逼继续             ║
         // ║                                                                            ║
         // ║ ── 让循环「收工」的场景（break）──                                         ║
@@ -3473,9 +3400,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             if (classification.type === "final" && classification.degraded)
               yield* slog.warn("degraded final on abnormal finish", { finish: lastAssistant.finish })
             if (classification.type !== "continue") {
-              // 场景：上一圈已是可收工的终态（final 等）。但收工前先过两道否决闸门（§5）：
-              // 还有未完成 task → continue；goal 未达成 → continue；都放行才真正收工。
-              if (yield* taskGate(lastUser)) continue
+              // 场景：上一圈已是可收工的终态（final 等）。收工前先过 goal 否决闸门（§5）：
+              // goal 未达成 → continue；放行才真正收工。
               if (yield* goalGate(lastUser)) continue
               yield* slog.info("exiting loop", { classification: classification.type })
               break
@@ -3924,6 +3850,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               )
               const ownNewModelMsgs = yield* MessageV2.toModelMessagesEffect(ownNew, model)
               const prebuiltSystem = forkCtx.system
+              lastSystemPrompt = prebuiltSystem
               const modelMsgs: ModelMessage[] = [...forkCtx.inheritedMessages, ...ownNewModelMsgs]
               // 对 fork agent 来说 additions 为空：system 逐字取自 forkCtx.system。
               // 作为 `system` 传给 handle.process 用于日志/回放。
@@ -3965,6 +3892,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     finish: handle.message.finish,
                     error: preQuery.cancelReason,
                     trajectory: trajectoryForStep(msgs, handle.message),
+                    systemPrompt: lastSystemPrompt,
                   },
                   {},
                 )
@@ -4015,6 +3943,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                             : sessionErrorText(handle.message.error),
                           finalText: assistantFinalText(handle.message, MessageV2.parts(handle.message.id)),
                           trajectory: trajectoryForStep(msgs, handle.message),
+                          systemPrompt: lastSystemPrompt,
                         },
                         {},
                       )
@@ -4036,6 +3965,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 if (yield* handleTextRepeat({ lastUser })) return "continue" as const
                 return "break" as const
               }
+              if (result === "stop") return "break" as const
 
               if (structured !== undefined) {
                 // 场景：拿到了要求的结构化输出（§4）→ 存下、收工。
@@ -4096,7 +4026,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
               if (forkClassification.type === "final" && forkClassification.degraded)
                 yield* slog.warn("degraded final on abnormal finish", { finish: handle.message.finish })
-              if (result === "stop") return "break" as const // 场景：模型正常说完（§4）→ 收工
               // 场景：子 agent 上下文溢出（§3.2）→ 按 actor 做有损压缩，随后 continue。
               // fork agent 始终是子 agent（lastUser.agentID 已设置）；溢出时使用
               // 按 actor 的 compaction（与非 fork 的子 agent 路径相同）。
@@ -4156,6 +4085,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 Effect.provideService(LLM.Service, llm),
                 Effect.provideService(ToolRegistry.Service, registry),
               )
+            lastSystemPrompt = prebuiltSystem
             const maxModeCfg = (yield* config.get()).experimental?.maxMode
             const useMaxMode =
               agent.name === MaxMode.MAX_MODE_AGENT && maxModeCfg !== undefined && format.type !== "json_schema"
@@ -4209,6 +4139,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   finish: handle.message.finish,
                   error: preQuery.cancelReason,
                   trajectory: trajectoryForStep(msgs, handle.message),
+                  systemPrompt: lastSystemPrompt,
                 },
                 {},
               )
@@ -4246,6 +4177,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                         : sessionErrorText(handle.message.error),
                       finalText: assistantFinalText(handle.message, MessageV2.parts(handle.message.id)),
                       trajectory: trajectoryForStep(msgs, handle.message),
+                      systemPrompt: lastSystemPrompt,
                     },
                     {},
                   )
@@ -4267,6 +4199,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               if (yield* handleTextRepeat({ lastUser })) return "continue" as const
               return "break" as const
             }
+            if (result === "stop") return "break" as const
 
             if (structured !== undefined) {
               // 场景：拿到了要求的结构化输出（§4）→ 存下、收工。
@@ -4325,7 +4258,6 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
             if (classification.type === "final" && classification.degraded)
               yield* slog.warn("degraded final on abnormal finish", { finish: handle.message.finish })
-            if (result === "stop") return "break" as const // 场景：模型正常说完（§4）→ 收工
             if (!isBoundedComputation && result === "overflow") {
               // 子 agent 溢出 → 按 actor 的 compaction。插入一个用子 agent 的 agent_id
               // 标记的边界；下一次 runLoop 迭代将看到裁剪后的上下文（filterCompactedEffect
@@ -4449,10 +4381,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             // 场景：这一步想收工（模型说完 / 终态 / 各类重试用尽）。
             // A hard halt is terminal — skip the ReAct re-entry gates so a
             // degraded model can't be re-driven into the same empty loop.
-            if (hardHalt) break // 硬熔断（§2.6）：直接收工，跳过下面两道否决闸门
-            if (yield* taskGate(lastUser)) continue // 还有未完成 task（§5.1）→ 被否决，强制再转一圈
+            if (hardHalt) break // 硬熔断（§2.6）：直接收工，跳过 goal 否决闸门
             if (yield* goalGate(lastUser)) continue // goal 未达成（§5.2）→ 被否决，强制再转一圈
-            break // 两道闸门都放行 → 真正收工
+            break // 闸门放行 → 真正收工
           }
           // 场景：这一步是 continue（模型调了工具要喂回结果 / 触发了某个重试）→ 再转一圈。
           continue
@@ -4830,7 +4761,6 @@ export const defaultLayer = Layer.suspend(() =>
         CrossSpawnSpawner.defaultLayer,
         Inbox.defaultLayer,
         Goal.defaultLayer,
-        TaskGateState.defaultLayer,
         TaskRegistry.defaultLayer,
       ),
     ),

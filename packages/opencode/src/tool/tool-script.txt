@@ -1,0 +1,46 @@
+Execute a TypeScript script that orchestrates existing tools programmatically. Use this for BATCH tool operations: loops, concurrency, filtering, and aggregation over many tool calls — the intermediate results stay OUT of the conversation context; only what you `return` comes back.
+
+The `code` argument is the BODY of an async function (TypeScript or JavaScript):
+- Call tools via the `tools` object, e.g. `await tools.glob({ pattern: "src/**/*.ts" })`
+- Every tool returns `Promise<ToolResult>` where `ToolResult = { title: string; output: string; metadata: Record<string, unknown> }` — `output` is the same text you would see when calling the tool directly (may be truncated for very large outputs; check `metadata.truncated`).
+- Use `Promise.all` / `Promise.allSettled` for concurrency (max 8 in flight; excess queue automatically).
+- `console.log(...)` output is captured and returned alongside the result (capped) — use it for debugging, not as the primary channel.
+- `return` a SMALL, aggregated value (object/array/string). Returning huge raw data defeats the purpose.
+
+Limits per execution: 50 tool calls, 8 concurrent, 60s of pure compute time (time spent waiting on tool calls is NOT charged), result capped at 256KB. Exceeding a limit fails the execution with a structured error.
+
+Permissions are enforced per tool call exactly as if you had called the tool directly — calls may pause awaiting user approval; a user rejection rejects that call's promise (catchable).
+
+State does NOT persist between executions: each tool_script call runs in a fresh sandbox — variables from a previous execution are gone. To pass data between executions, either `return` it (best for small results) or use the `files` raw-IO API to stage it in a temp file:
+```
+await files.writeText("/tmp/scan-results.json", JSON.stringify(hits))
+// ...next tool_script execution:
+const hits = JSON.parse(await files.readText("/tmp/scan-results.json"))
+```
+
+`tools.*` outputs are the AGENT-FACING text (e.g. `read` prefixes lines with `N: ` line numbers and may truncate). That is fine for scanning/matching, but for exact bytes (parsing JSON, byte-accurate content) use `files.readText` instead — raw content, no line numbers, no truncation. `files.readText` covers the project worktree and the OS temp dir; `files.writeText` is limited to the OS temp dir — project file writes must go through `tools.write` / `tools.edit` so permissions apply.
+
+When to use tool_script:
+- Same tool called many times (read 30 files, grep 10 patterns)
+- Results need deterministic filtering/aggregation/sorting/counting before you see them
+- Large intermediate outputs you don't need to read verbatim
+
+When NOT to use tool_script:
+- A single tool call — call the tool directly
+- Each step needs semantic judgment on the previous result — stay in the normal loop
+- You need to visually inspect results (images, screenshots)
+- High-risk side effects better done one at a time with your review between steps
+
+Example:
+```
+const files = await tools.glob({ pattern: "src/**/*.ts" })
+const paths = files.output.split("\n").filter(p => p.trim() && !p.startsWith("("))
+const reads = await Promise.all(paths.map(p => tools.read({ file_path: p })))
+const hits = paths
+  .map((p, i) => ({ path: p, todos: (reads[i].output.match(/TODO/g) ?? []).length }))
+  .filter(x => x.todos > 0)
+  .sort((a, b) => b.todos - a.todos)
+return { total: hits.length, top: hits.slice(0, 20) }
+```
+
+The available tools and their exact input types are declared below.

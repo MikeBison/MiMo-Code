@@ -304,7 +304,6 @@ export const layer = Layer.effect(
     const available = Effect.fn("Skill.available")(function* (agent?: Agent.Info) {
       const s = yield* InstanceState.get(state)
       let list: Info[] = Object.values(s.skills)
-        .filter((sk) => !sk.hidden)
 
       list = list.toSorted((a, b) => a.name.localeCompare(b.name))
       if (!agent) return list

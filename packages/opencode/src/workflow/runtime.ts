@@ -436,19 +436,39 @@ export const layer = Layer.effect(
     // worktree the run still owns, then clear the set. NEVER throws — a reclaim
     // failure must not mask the original terminal cause. NOT called on success:
     // kept (success+changed) worktrees are the deliverable and must survive.
+    // Worktree removal is bounded by RECLAIM_WORKTREE_TIMEOUT_MS so a hung
+    // git worktree remove (e.g. processes using the worktree) cannot block
+    // cancel indefinitely. Actor cancel is bounded by RECLAIM_ACTOR_TIMEOUT_MS
+    // so a hung child actor cannot block reclaim indefinitely.
+    const RECLAIM_WORKTREE_TIMEOUT_MS = 10_000
+    const RECLAIM_ACTOR_TIMEOUT_MS = 5_000
     const reclaim = (entry: RunEntry) =>
       Effect.gen(function* () {
         const actor = spawnRef.current
         if (actor) {
           yield* Effect.forEach(
             [...entry.childActorIDs],
-            (childID) => actor.cancel(entry.sessionID, childID, "graceful").pipe(Effect.ignore),
+            (childID) =>
+              actor.cancel(entry.sessionID, childID, "graceful").pipe(
+                Effect.timeout(RECLAIM_ACTOR_TIMEOUT_MS),
+                Effect.catchTag("TimeoutError", () =>
+                  Effect.sync(() => log.warn("actor cancel timed out during reclaim", { childID })),
+                ),
+                Effect.ignore,
+              ),
             { concurrency: "unbounded", discard: true },
           )
         }
         yield* Effect.forEach(
           [...entry.worktrees],
-          (directory) => worktree.remove({ directory }).pipe(Effect.ignore),
+          (directory) =>
+            worktree.remove({ directory }).pipe(
+              Effect.timeout(RECLAIM_WORKTREE_TIMEOUT_MS),
+              Effect.catchTag("TimeoutError", () =>
+                Effect.sync(() => log.warn("worktree remove timed out during reclaim", { directory })),
+              ),
+              Effect.ignore,
+            ),
           { concurrency: "unbounded", discard: true },
         )
         entry.worktrees.clear()
@@ -472,13 +492,25 @@ export const layer = Layer.effect(
         )
       })
 
+    // Bounded interrupt: Fiber.interrupt can stall on a hung LLM fetch or an
+    // uninterruptible operation. Bounding it so cancel completes in finite time.
+    const FIBER_INTERRUPT_TIMEOUT_MS = 5_000
     const cancelEntry = (entry: RunEntry): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (entry.status !== "running") return
+        // Interrupt the fiber FIRST so that downstream reclaim (which disposes
+        // worktrees and triggers scope-close finalizers) doesn't deadlock waiting
+        // for a still-running agent fiber to finish.
+        if (entry.fiber)
+          yield* Fiber.interrupt(entry.fiber).pipe(
+            Effect.timeout(FIBER_INTERRUPT_TIMEOUT_MS),
+            Effect.catchTag("TimeoutError", () =>
+              Effect.sync(() => log.warn("fiber interrupt timed out during cancel", { runID: entry.runID })),
+            ),
+          )
         yield* reclaim(entry)
         yield* flushNow(entry)
         yield* WorkflowPersistence.recordTerminal({ runID: entry.runID, status: "cancelled" }).pipe(Effect.ignore)
-        if (entry.fiber) yield* Fiber.interrupt(entry.fiber)
         entry.status = "cancelled"
         yield* Deferred.succeed(entry.deferred, { status: "cancelled" })
         yield* bus.publish(WorkflowFinished, { sessionID: entry.sessionID, runID: entry.runID, status: "cancelled" })
@@ -972,6 +1004,7 @@ export const layer = Layer.effect(
         // disposition below owns it) rather than the returned deliverable: in the
         // isolated path a successful agent's work is its worktree, so a status
         // success is a success even when it returned no text.
+        if (spawned) await Instance.disposeDirectory(info.directory)
         entry.running--
         if (succeeded) entry.succeeded++
         else {

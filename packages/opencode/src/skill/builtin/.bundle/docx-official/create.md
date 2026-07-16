@@ -250,6 +250,7 @@ def ref(paragraph, name):
 | Table borders vanish on save | You cleared `table.style` after populating cells | Set `table.style` **before** populating; don't reassign later. |
 | Image renders huge | Only `width` or `height` supplied ≥ page width | Compute `Cm(15)` (roughly page-content width) and let the other axis auto-scale. |
 | File opens with "content had problems" | Manually inserted XML with unbalanced tags | Reopen the exploded directory, run `xmllint --noout word/document.xml`, fix the offending element. |
+| "Missing font" warning on open (Cambria, Calibri, CJK fonts) | `python-docx` default template embeds font references in theme XML that may not be installed | Patch the theme after `Document()` — see recipe below. |
 | Chinese / non-ASCII text renders as `??` in some viewers | Font run has no East-Asian font | Set both `rFonts.ascii` and `rFonts.eastAsia`: `run.font.name = "Calibri"; run._element.rPr.rFonts.set(qn("w:eastAsia"), "Microsoft YaHei")` |
 
 ## Recipes
@@ -309,6 +310,37 @@ p = doc.add_paragraph("Note: figures are unaudited.")
 shade_paragraph(p, "FFF4CE")
 ```
 
+### Patch default theme fonts (suppress "missing font" warnings)
+
+`Document()` ships with a theme referencing Cambria, Calibri, and CJK fallback fonts (MS Gothic, MS Mincho) that may not exist on the target system. Viewers warn about them even when every run has an explicit font. Patch the theme right after creation:
+
+```python
+from lxml import etree
+
+doc = Document()
+
+# --- patch theme font definitions ---
+theme_rel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/theme"
+theme_part = doc.part.part_related_by(theme_rel)
+theme_xml = etree.fromstring(theme_part.blob)
+
+ns = {"a": "http://schemas.openxmlformats.org/drawingml/2006/main"}
+for latin in theme_xml.xpath("//a:majorFont/a:latin | //a:minorFont/a:latin", namespaces=ns):
+    latin.set("typeface", "Times New Roman")       # or your preferred Latin font
+for font in theme_xml.xpath("//a:majorFont/a:font | //a:minorFont/a:font", namespaces=ns):
+    if font.get("script", "") in ("Hans", "Hant", "Jpan", "Hang"):
+        font.set("typeface", "SimSun")             # or your preferred CJK font
+
+theme_part._blob = etree.tostring(theme_xml, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+# --- patch Courier → Courier New in macro styles ---
+for style in doc.styles:
+    if hasattr(style, "font") and style.font.name == "Courier":
+        style.font.name = "Courier New"
+```
+
+Call this once, immediately after `Document()`, before adding content. Choose fonts you know exist on your target audience's systems. For CJK documents the most portable choices are SimSun / 宋体 (Chinese), MS Mincho (Japanese), or Malgun Gothic (Korean).
+
 ## Testing your generator
 
 Every generator should be runnable and produce a file with **exactly one call**:
@@ -320,9 +352,9 @@ python your_generator.py --out out/report.docx --data data.json
 Then run the four QA steps from `SKILL.md` — the ones you must never skip:
 
 ```bash
-python -c "import docx; docx.Document('out/report.docx')"
-python scripts/extract_text.py out/report.docx | grep -Ei "TODO|TBD|\{\{"
-python scripts/render_pdf.py out/report.docx
+uv run python -c "import docx; docx.Document('out/report.docx')"
+uv run scripts/extract_text.py out/report.docx | grep -Ei "TODO|TBD|\{\{"
+uv run scripts/render_pdf.py out/report.docx
 ```
 
 If the import check raises or the grep matches anything, treat it as a build

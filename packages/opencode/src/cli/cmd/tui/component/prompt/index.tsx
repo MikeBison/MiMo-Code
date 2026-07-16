@@ -191,7 +191,7 @@ export function Prompt(props: PromptProps) {
 
   function voiceSwitchAgent(name: string) {
     const match = local.agent.list().find((x) => x.name.toLowerCase() === name.toLowerCase())
-    if (match) local.agent.set(match.name)
+    if (match) local.agent.userSwitch(match.name)
     else toast.show({ message: t("tui.voice.error.unknown_agent", { name: name }), variant: "error", duration: 3000 })
   }
 
@@ -507,6 +507,11 @@ export function Prompt(props: PromptProps) {
     ),
   )
 
+  // Derive sticky mode from whether session has messages
+  createEffect(() => {
+    local.agent.setSessionHasMessages(!!lastUserMessage())
+  })
+
   // Initialize agent/model/variant from last user message when session changes
   let syncedSessionID: string | undefined
   createEffect(() => {
@@ -515,7 +520,6 @@ export function Prompt(props: PromptProps) {
 
     if (sessionID !== syncedSessionID) {
       if (!sessionID || !msg) return
-
       syncedSessionID = sessionID
 
       // Only set agent if it's a primary agent (not a subagent)

@@ -50,6 +50,7 @@ import type { TaskTool } from "@/tool/task"
 import type { QuestionTool } from "@/tool/question"
 import type { SkillTool } from "@/tool/skill"
 import type { WorkflowTool } from "@/tool/workflow"
+import type { ToolScriptTool } from "@/tool/tool-script"
 import { useKeyboard, useRenderer, useTerminalDimensions, type JSX } from "@opentui/solid"
 import { useSDK } from "@tui/context/sdk"
 import { useCommandDialog } from "@tui/component/dialog-command"
@@ -2129,6 +2130,9 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
         <Match when={props.part.tool === "workflow"}>
           <Workflow {...toolprops} />
         </Match>
+        <Match when={props.part.tool === "tool_script"}>
+          <ToolScript {...toolprops} />
+        </Match>
         <Match when={props.part.tool === "plan_exit"}>
           <PlanExit {...toolprops} />
         </Match>
@@ -2225,6 +2229,65 @@ function WorkItemTask(props: ToolProps<typeof TaskTool>) {
     <InlineTool icon="#" pending="Updating tasks..." complete={true} part={props.part}>
       task {summary()}
     </InlineTool>
+  )
+}
+
+// Renderer for the `tool_script` batch-orchestration tool. Default view is a
+// single InlineTool line — spinner + live aggregated call counts while running
+// (published through ctx.metadata), one muted summary line when done. Clicking
+// swaps to the full BlockTool with code, result, logs and per-call trace.
+function ToolScript(props: ToolProps<typeof ToolScriptTool>) {
+  const { theme } = useTheme()
+  const [expanded, setExpanded] = createSignal(false)
+  const isRunning = createMemo(() => props.part.state.status === "running")
+  const meta = createMemo(() =>
+    props.part.state.status === "pending" ? ({} as Record<string, any>) : (props.part.state.metadata ?? {}),
+  )
+  const counts = createMemo(() => {
+    const c = meta().counts as Record<string, { n: number; errors: number }> | undefined
+    if (!c) return ""
+    return Object.entries(c)
+      .sort((a, b) => b[1].n - a[1].n)
+      .map(([name, v]) => `${name}×${v.n}${v.errors ? `(${v.errors}!)` : ""}`)
+      .join(" ")
+  })
+  const status = createMemo(() => meta().status as string | undefined)
+  const callCount = createMemo(() => (meta().toolCalls as number | undefined) ?? 0)
+  const failed = createMemo(() => status() !== undefined && status() !== "completed" && !isRunning())
+  const summary = createMemo(() => {
+    const c = counts()
+    const base = `${callCount()} calls${c ? ` · ${c}` : ""}`
+    if (isRunning()) return base
+    return failed() ? `${status()} · ${base}` : base
+  })
+
+  return (
+    <Show
+      when={expanded()}
+      fallback={
+        <InlineTool
+          icon="»"
+          iconColor={failed() ? theme.error : undefined}
+          pending="Writing script..."
+          complete={!isRunning()}
+          spinner={isRunning()}
+          part={props.part}
+          onClick={() => setExpanded(true)}
+        >
+          tool_script {summary()}
+        </InlineTool>
+      }
+    >
+      <BlockTool title={`# tool_script · ${summary()}`} part={props.part} onClick={() => setExpanded(false)}>
+        <box gap={1}>
+          <text fg={theme.textMuted}>{((props.input.code as string | undefined) ?? "").trim()}</text>
+          <Show when={props.output}>
+            <text fg={failed() ? theme.error : theme.text}>{props.output}</text>
+          </Show>
+          <text fg={theme.textMuted}>Click to collapse</text>
+        </box>
+      </BlockTool>
+    </Show>
   )
 }
 

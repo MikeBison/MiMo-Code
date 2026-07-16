@@ -47,7 +47,6 @@ import { Team } from "../../src/team"
 import { SessionCheckpoint } from "../../src/session/checkpoint"
 import { TaskRegistry } from "../../src/task/registry"
 import { defaultLayer as SchedulerDefaultLayer } from "../../src/cron/scheduler"
-import { TaskGateState } from "../../src/task/gate-state"
 import { Auth } from "../../src/auth"
 import { Log } from "../../src/util"
 import * as CrossSpawnSpawner from "../../src/effect/cross-spawn-spawner"
@@ -189,7 +188,6 @@ function makeLayers() {
   const trunc = Truncate.layer.pipe(Layer.provideMerge(deps))
   return SessionPrompt.layer.pipe(
     Layer.provide(Goal.defaultLayer),
-    Layer.provide(TaskGateState.defaultLayer),
     Layer.provide(TaskRegistry.defaultLayer),
     Layer.provide(SchedulerDefaultLayer),
     Layer.provide(SessionRevert.defaultLayer),

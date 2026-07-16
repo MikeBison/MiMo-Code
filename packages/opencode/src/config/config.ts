@@ -391,6 +391,22 @@ const InfoSchema = Schema.Struct({
       continue_loop_on_deny: Schema.optional(Schema.Boolean).annotate({
         description: "Continue the agent loop when a tool call is denied",
       }),
+      try_best: Schema.optional(
+        Schema.Struct({
+          edit_window: Schema.optional(PositiveInt).annotate({
+            description: "Recent edit events to compare (default 12).",
+          }),
+          edit_similarity: Schema.optional(Schema.Number).annotate({
+            description: "Jaccard threshold for near-identical edit detection (default 0.8).",
+          }),
+          edit_matches: Schema.optional(PositiveInt).annotate({
+            description: "Prior similar edits required before pausing (default 2).",
+          }),
+          action_streak: Schema.optional(PositiveInt).annotate({
+            description: "Consecutive edit or verify actions without progress before pausing (default 4).",
+          }),
+        }),
+      ).annotate({ description: "Try-best loop detector thresholds." }),
       mcp_timeout: Schema.optional(PositiveInt).annotate({
         description: "Timeout in milliseconds for model context protocol (MCP) requests",
       }),

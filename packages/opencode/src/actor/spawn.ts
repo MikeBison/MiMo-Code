@@ -463,8 +463,7 @@ export const layer = Layer.effect(
             onSuccess: ({ finalText, structured }) =>
               Effect.gen(function* () {
                 // === COMPLETION GATE (B) + structured parse (A) ===
-                // Delegates the list/decide step to TaskGate.decide so the
-                // logic is shared with the main-session taskGate (prompt.ts).
+                // Delegates the list/decide step to TaskGate.decide.
                 // We retain the runTurn re-entry + delivered-text update here
                 // because that is gate-policy, not list-policy.
                 let deliveredText = finalText
@@ -476,7 +475,6 @@ export const layer = Layer.effect(
                       owner: input.actorID,
                       reactCount: gateIter,
                       maxReact: MAX_TASK_GATE_SUBAGENT_REACT,
-                      mode: "subagent",
                     }).pipe(Effect.provideService(TaskRegistry.Service, taskRegistry))
                     if (!decision.needReentry) break
                     gateIter++

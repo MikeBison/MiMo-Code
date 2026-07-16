@@ -6,7 +6,7 @@ import { Cause, Effect, Exit, Layer } from "effect"
 import * as CrossSpawnSpawner from "@/effect/cross-spawn-spawner"
 import { Instance } from "../../src/project/instance"
 import { Worktree } from "../../src/worktree"
-import { provideInstance, provideTmpdirInstance } from "../fixture/fixture"
+import { provideTmpdirInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(Layer.mergeAll(Worktree.defaultLayer, CrossSpawnSpawner.defaultLayer))
@@ -119,6 +119,19 @@ describe("Worktree", () => {
 
             const ok = yield* svc.remove({ directory: info.directory })
             expect(ok).toBe(true)
+            let initialized = 0
+            yield* Effect.promise(() =>
+              Instance.provide({
+                directory: info.directory,
+                init: () => {
+                  initialized++
+                  return Promise.resolve()
+                },
+                fn: () => undefined,
+              }),
+            )
+            expect(initialized).toBe(1)
+            yield* Effect.promise(() => Instance.disposeDirectory(info.directory))
           }),
         { git: true, outsideGit: true },
       ),
@@ -143,8 +156,6 @@ describe("Worktree", () => {
             expect(props.name).toBe(info.name)
             expect(props.branch).toBe(info.branch)
 
-            yield* Effect.promise(() => Instance.dispose()).pipe(provideInstance(info.directory))
-            yield* Effect.promise(() => Bun.sleep(100))
             yield* svc.remove({ directory: info.directory })
           }),
         { git: true, outsideGit: true },
@@ -163,8 +174,6 @@ describe("Worktree", () => {
             expect(info.branch).toBe("mimocode/test-workspace")
 
             yield* Effect.promise(() => ready)
-            yield* Effect.promise(() => Instance.dispose()).pipe(provideInstance(info.directory))
-            yield* Effect.promise(() => Bun.sleep(100))
             yield* svc.remove({ directory: info.directory })
           }),
         { git: true, outsideGit: true },
@@ -224,7 +233,7 @@ describe("Worktree", () => {
 
             expect(outerRef).toBe(worktreeHead)
 
-            yield* Effect.promise(() => Instance.dispose()).pipe(provideInstance(info.directory))
+            yield* Effect.promise(() => Instance.disposeDirectory(info.directory))
             yield* Effect.promise(() => Bun.sleep(100))
             yield* svc.remove({ directory: info.directory })
           }),
@@ -272,7 +281,7 @@ describe("Worktree", () => {
             }
 
             for (const { info } of heads) {
-              yield* Effect.promise(() => Instance.dispose()).pipe(provideInstance(info.directory))
+              yield* Effect.promise(() => Instance.disposeDirectory(info.directory))
             }
             yield* Effect.promise(() => Bun.sleep(100))
             for (const { info } of heads) {
@@ -290,8 +299,33 @@ describe("Worktree", () => {
         (dir) =>
           Effect.gen(function* () {
             const svc = yield* Worktree.Service
-            const ok = yield* svc.remove({ directory: path.join(dir, "does-not-exist") })
+            const target = path.join(dir, "does-not-exist")
+            let initialized = 0
+            yield* Effect.promise(() =>
+              Instance.provide({
+                directory: target,
+                init: () => {
+                  initialized++
+                  return Promise.resolve()
+                },
+                fn: () => undefined,
+              }),
+            )
+
+            const ok = yield* svc.remove({ directory: target })
             expect(ok).toBe(true)
+            yield* Effect.promise(() =>
+              Instance.provide({
+                directory: target,
+                init: () => {
+                  initialized++
+                  return Promise.resolve()
+                },
+                fn: () => undefined,
+              }),
+            )
+            expect(initialized).toBe(2)
+            yield* Effect.promise(() => Instance.disposeDirectory(target))
           }),
         { git: true, outsideGit: true },
       ),

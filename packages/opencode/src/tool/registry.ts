@@ -68,6 +68,8 @@ import { shellWrap } from "./shell-wrap"
 import * as BashInteractive from "./bash-interactive"
 import { resolveInvocationStyle } from "./invocation-style"
 import { BuiltinWorkflow } from "@/workflow/builtin"
+import { ToolScriptTool, renderToolScriptDeclarations } from "./tool-script"
+import { toolScriptRegistry } from "./tool-script-ref"
 
 const log = Log.create({ service: "tool.registry" })
 
@@ -155,6 +157,7 @@ export const layer = Layer.effect(
     const crontool = yield* CronTool
     const sessiontool = yield* SessionTool
     const workflowtool = yield* WorkflowTool
+    const toolscript = yield* ToolScriptTool
     const agent = yield* Agent.Service
 
     const state = yield* InstanceState.make<State>(
@@ -251,6 +254,7 @@ export const layer = Layer.effect(
           cron: Tool.init(crontool),
           session: Tool.init(sessiontool),
           workflow: Tool.init(workflowtool),
+          toolscript: Tool.init(toolscript),
         })
 
         return {
@@ -278,6 +282,7 @@ export const layer = Layer.effect(
             tool.memory,
             tool.history,
             tool.task,
+            tool.toolscript,
             ...(Flag.MIMOCODE_EXPERIMENTAL_CRON ? [tool.cron] : []),
             ...(Flag.MIMOCODE_EXPERIMENTAL_ORCHESTRATOR ? [tool.session] : []),
             ...(Flag.MIMOCODE_EXPERIMENTAL_WORKFLOW_TOOL ? [tool.workflow] : []),
@@ -294,6 +299,10 @@ export const layer = Layer.effect(
       const builtins = s.builtin.filter((t) => !customIds.has(t.id))
       return [...builtins, ...s.custom] as Tool.Def[]
     })
+
+    // Late-bound ref (see tool-script-ref.ts): tool_script dispatches guest RPC
+    // calls through the same def list the agent sees, without a module cycle.
+    toolScriptRegistry.current = all
 
     const ids: Interface["ids"] = Effect.fn("ToolRegistry.ids")(function* () {
       return (yield* all()).map((tool) => tool.id)
@@ -320,6 +329,10 @@ export const layer = Layer.effect(
 
     const describeWorkflow = Effect.fn("ToolRegistry.describeWorkflow")(function* () {
       return renderWorkflowCatalog()
+    })
+
+    const describeToolScript = Effect.fn("ToolRegistry.describeToolScript")(function* () {
+      return renderToolScriptDeclarations(yield* all())
     })
 
     const describeTask = Effect.fn("ToolRegistry.describeTask")(function* (agent: Agent.Info) {
@@ -397,6 +410,7 @@ export const layer = Layer.effect(
               tool.id === ActorTool.id ? yield* describeTask(input.agent) : undefined,
               tool.id === SkillTool.id ? yield* describeSkill(input.agent) : undefined,
               tool.id === WorkflowTool.id ? yield* describeWorkflow() : undefined,
+              tool.id === ToolScriptTool.id ? yield* describeToolScript() : undefined,
             ]
               .filter(Boolean)
               .join("\n"),
