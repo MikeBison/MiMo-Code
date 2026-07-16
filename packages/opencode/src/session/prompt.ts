@@ -2550,20 +2550,31 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       }
     })
 
+    // ============================================================================
+    // prompt：SessionPrompt 对外的【主入口】——用户发一条消息就从这进。
+    // 职责:清理 → 兑现用户消息落库 → 启动 agent 循环 → 返回最终助手消息。
+    // 调用链枢纽:prompt → loop → runLoop(while 循环) → resolveTools/handleSubtask...
+    // 把前面学的所有函数串成一条"用户消息 → AI 回复"的完整链路。
+    // ============================================================================
     const prompt: (input: PromptInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.prompt")(
       function* (input: PromptInput) {
         const session = yield* sessions.get(input.sessionID)
+        // 前置工作:只对"真人直接发的消息"做清理;排除子 agent 派生(spawn)和定时/钩子(hook)这类系统内部发起的。
         if (input.source !== "spawn" && input.source !== "hook") {
-          yield* revert.cleanup(session)
+          yield* revert.cleanup(session) // 清理上一轮的回退暂存
+          // 会话空闲=无活跃 runner,此时任何未完成的助手消息都是硬中断留下的真孤儿 → 立即清
+          //(把 idle 作为 immediate 传入),免得新消息被那个假性 QUEUED 挡住。
           // An idle session has no active runner, so any dangling assistant is a
           // true orphan from a hard interruption — sweep it now (age-independent)
           // so a fresh message is not rendered as stuck QUEUED behind it.
           const idle = (yield* status.get(input.sessionID)).type === "idle"
           yield* sweepOrphanAssistants(input.sessionID, idle)
         }
+        // 把输入 parts 兑现成完整用户消息并落库(见 createUserMessage)。
         const message = yield* createUserMessage(input)
-        yield* sessions.touch(input.sessionID)
+        yield* sessions.touch(input.sessionID) // 更新会话"最后活动时间",供列表排序
 
+        // 向后兼容:input.tools 是老的 {工具名:是否启用} 开关,翻译成权限规则集写到会话上(已 @deprecated)。
         const permissions: Permission.Ruleset = []
         for (const [t, enabled] of Object.entries(input.tools ?? {})) {
           permissions.push({ permission: t, action: enabled ? "allow" : "deny", pattern: "*" })
@@ -2573,7 +2584,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           yield* sessions.setPermission({ sessionID: session.id, permission: permissions })
         }
 
+        // noReply:只存用户消息、不触发 AI 回复(如 /goal clear 那种只想塞条消息的场景)。
         if (input.noReply === true) return message
+        // 否则启动 agent 主循环(默认 agentID="main"),这才是"让 AI 干活"。返回最终助手消息。
         return yield* loop({ sessionID: input.sessionID, agentID: input.agentID ?? "main", task_id: input.task_id })
       },
     )
@@ -3292,6 +3305,50 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           })
         })
 
+        // ╔══════════════════════════════════════════════════════════════════════════╗
+        // ║ runLoop 主循环（ReAct 循环）总览                                           ║
+        // ╠══════════════════════════════════════════════════════════════════════════╣
+        // ║ 每一圈 = 一个 step，本质是「读上下文 → 调模型 → 执行工具 → 结果喂回 → 再来   ║
+        // ║ 一圈」，直到模型交出最终答案。一圈的顺序大致是：                            ║
+        // ║   1) 标记 busy、drain 收件箱、按 agentID 过滤出本 agent 可见的消息切片       ║
+        // ║   2) 先对「已有的」助手消息分类，能提前判定就不白调模型                      ║
+        // ║   3) step++；首圈做杂活（生成标题 / auto-dream / distill / cron）           ║
+        // ║   4) 特殊路由：compaction 边界标记 / subtask 派生 / 上下文压力提醒           ║
+        // ║   5) 溢出检查：主 agent 走 checkpoint 重建、子 agent/回退走 compaction       ║
+        // ║   6) 建空助手消息 → 调模型（fork 用冻结快照 / 主用现算前缀）→ 得 result     ║
+        // ║   7) 过一连串「控制闸门」把 result 归纳成 outcome（"break" | "continue"）    ║
+        // ║   8) outcome==="break" 时仍要过 taskGate / goalGate，可被否决而强制 continue ║
+        // ║ 循环外收尾：后台 prune → 取 final → 发指标 → 唤醒型 peer 通知父级 → return   ║
+        // ║ 整段被 Effect.onExit(firePostSession) 包裹：无论成功/失败/中断都触发         ║
+        // ║ session.post 钩子（try/finally 语义）。                                     ║
+        // ╠══════════════════════════════════════════════════════════════════════════╣
+        // ║ 控制闸门场景一览（模型不可靠，每个闸门拦一种「异常」，能救则 continue 重试，  ║
+        // ║ 救不动 / 达终态则 break；带 * 者仅主 agent）：                              ║
+        // ║                                                                            ║
+        // ║ ── 让循环「继续」的场景（continue，通常是重试或喂回工具结果）──             ║
+        // ║ • 模型调用了工具            : result==="continue" 且未被其它闸门拦截         ║
+        // ║ • 输出被 token 上限截断     : autoContinueOutputLength → 注入「接着说」      ║
+        // ║ • 只思考没给答案 / 空内容   : autoContinueInvalidOutput（think-only/invalid）║
+        // ║ • 工具调用被写成纯文本      : autoRetryTextToolCall（text-tool-call）        ║
+        // ║ • 要 json_schema 却没产出   : autoRetryStructuredOutput                      ║
+        // ║ • 复读机（可救档）          : handleTextRepeat → 提醒 / 换思路              ║
+        // ║ • 空步骤（可救档）          : handleEmptyStep（调了工具但无实质内容）        ║
+        // ║ • 上下文溢出               : 主 agent→checkpoint 重建；子 agent→compaction   ║
+        // ║ • compaction 边界标记      : 路由到 compaction.process，非 stop 则 continue  ║
+        // ║ • subtask 派生             : handleSubtask 后 continue                      ║
+        // ║ *• taskGate 否决 break     : 模型想停但仍有未完成 task → 逼继续              ║
+        // ║ *• goalGate 否决 break     : 裁判模型判定用户目标未达成 → 逼继续             ║
+        // ║                                                                            ║
+        // ║ ── 让循环「收工」的场景（break）──                                         ║
+        // ║ • 模型正常说完              : result==="stop"                               ║
+        // ║ • 拿到结构化输出            : structured !== undefined                       ║
+        // ║ • 被内容安全过滤            : classify → filtered，写错误                    ║
+        // ║ • 模型报错                  : classify → failed，写错误                      ║
+        // ║ • 被插件取消                : session.userQuery.pre 里 cancel===true          ║
+        // ║ • fork 快照丢失             : forkCtx 缺失 → actor 失败                       ║
+        // ║ • 各「可救」闸门重试超限    : 复读/空转/文本工具调用/结构化重试用尽           ║
+        // ║ • 硬熔断                    : hardHalt（连续异常触顶）                        ║
+        // ╚══════════════════════════════════════════════════════════════════════════╝
         while (true) {
           // F55：只有主 agent 才把会话状态设为 busy；子 agent 的 runner
           // 不得触碰会话级状态（按 F47，非主 actor 的 Runner.onBusy 是 Effect.void）。
@@ -3429,6 +3486,20 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
 
+          // ┌─ 顺带跑的后台维护，与当前这轮对话无关 ───────────────────────────────
+          // │ 触发时机：仅「顶层会话（非子 agent）的第一圈」，即 step === 1 且没有 parentID。
+          // │ 用意：借用户开启新对话的时机，在后台捎带跑周期性的自我维护，全程不阻塞、
+          // │       不影响用户当前对话。三类维护任务：
+          // │   · dream   —— 把历史对话里可靠、已验证的信息沉淀进项目 memory（默认每 7 天）
+          // │   · distill —— 把反复出现的手动流程打包成可复用的 skill/agent（默认每 30 天）
+          // │   · cron    —— 实验性：给会话挂一个定时任务桥（受 feature flag 保护）
+          // │ 是否真的触发由 shouldAutoDream/shouldAutoDistill 决定，内部已带三层节流：
+          // │   配置开关 + 10s 进程内防抖 + 距上次运行的时间间隔；查询出错时兜底为 false
+          // │   （维护任务绝不能拖垮用户的正常对话）。
+          // │ 执行方式：下面每个任务都用 AppRuntime.runPromise(...).catch(...) 各自「发射后
+          // │   不管」——新开一个独立会话、在独立 runtime 上运行，出错只记日志，不 await，
+          // │   因此不会卡住当前 runLoop。
+          // └──────────────────────────────────────────────────────────────────────
           if (step === 1 && !session.parentID) {
             const cfg = yield* config.get()
             const dreamTrigger = yield* shouldAutoDream(cfg).pipe(Effect.catch(() => Effect.succeed(false)))
@@ -3525,6 +3596,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           //   2. 在压力持续偏高时于每一轮用户 turn 都重新注入提示，会把一次性的提醒
           //      变成逐 turn 的唠叨。我们现在在最近的对话窗口内去重，而不仅是当前
           //      这条用户消息。
+          // 用户信息总结，上下文压缩
           if (lastFinished && lastFinished.summary !== true && model) {
             const cfg = yield* config.get()
             const pressure = pressureLevel({ cfg, tokens: lastFinished.tokens, model })
@@ -3545,6 +3617,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   type: "text",
                   synthetic: true,
                   text: [
+                    // <系统提醒>
+                    // 上下文容量即将占满（负载阈值：${pressure >= 3 时 >85%，否则 >70%}）。
+                    // 本次会话中若存在尚未存入记忆的重要结论、关键决策或学习要点，请立刻记录下来（这些内容将在下一轮检查点统一摘要归档）。
+                    // 本提示仅用于提醒保存工作进度。
+
+                    // 重点要求：完成记忆写入后，**本轮继续执行原有任务**。
+                    // 严禁因本提醒中断任务、收尾会话或将操作权限交还给用户；仅当全部实际工作完成后，方可结束流程。
+                    // </系统提醒>
                     "<system-reminder>",
                     `Context is filling up (${pressure >= 3 ? ">85%" : ">70%"}).`,
                     "If you have important learnings or decisions from this session that are",
@@ -3563,6 +3643,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           // 重复步骤提示：如果最近 REPEATED_STEP_THRESHOLD 个已完成的助手步骤发起了
           // 相同的工具调用，模型很可能陷入了循环。在最后一条用户消息上注入一条提醒，
           // 要求它改变思路。与上面的内存刷写提示相同（合成文本 part，按 build 去重）。
+          // 防止死循环
           if (lastFinished) {
             const recentSignatures: string[] = []
             for (let i = msgs.length - 1; i >= 0 && recentSignatures.length < REPEATED_STEP_THRESHOLD; i--) {
@@ -3590,6 +3671,10 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   type: "text",
                   synthetic: true,
                   text: [
+                    // <系统提醒>
+                    // 你最近连续 ${REPEATED_STEP_THRESHOLD} 步操作完全一致，一直在重复相同动作且没有任何进展。
+                    // 请立刻停下重新思考：当前思路行不通。更换别的方案、调用其他工具；若陷入卡顿，向用户说明阻碍原因，不要再重复执行相同步骤。
+                    // </系统提醒>
                     "<system-reminder>",
                     `Your last ${REPEATED_STEP_THRESHOLD} steps have been identical — you appear to be`,
                     "repeating the same action without making progress. Stop and reconsider:",
@@ -3758,6 +3843,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             if (step === 1)
               yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
 
+            // 当前任务没完成时，用户发送了新的消息触发
             if (step > 1 && lastFinished) {
               for (const m of msgs) {
                 if (m.info.role !== "user" || m.info.id <= lastFinished.id) continue
@@ -3765,6 +3851,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   if (p.type !== "text" || p.ignored || p.synthetic) continue
                   if (!p.text.trim()) continue
                   p.text = [
+                    // <系统提醒>
+                    // 用户发送了如下消息：
+                    // ${p.text}
+
+                    // 请回应这条消息，并继续完成当前任务。
+                    // </系统提醒>
                     "<system-reminder>",
                     "The user sent the following message:",
                     p.text,
