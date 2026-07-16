@@ -4535,6 +4535,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       },
     )
 
+    // ============================================================================
+    // loop：runLoop 的对外入口。用 state.ensureRunning 包一层「同一 (session, agent)
+    // 同时只跑一个循环」的并发保护——已有在跑就复用其结果、不重复启动；否则启动 runLoop。
+    // 供 actor 系统 / prompt 调用，驱动某个 agent 的 ReAct 主循环（本文件的核心）。
+    // 与 shell / command 平行：三者都是把某种输入接进会话运行态，但 loop 跑的是模型循环。
+    // ============================================================================
     const loop: (input: z.infer<typeof LoopInput>) => Effect.Effect<MessageV2.WithParts> = Effect.fn(
       "SessionPrompt.loop",
     )(function* (input: z.infer<typeof LoopInput>) {
@@ -4547,12 +4553,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       )
     })
 
+    // ============================================================================
+    // shell：用户在 TUI 里直接敲 shell 命令（如 !git status）的对外入口。
+    // 委托 shellImpl 真正执行，并用 state.startShell 纳入会话运行态管理（可取消/互斥）。
+    // 不调模型——只把「用户手敲的命令 + 输出」记进对话历史，让 AI 也能看到（人机共享终端）。
+    // ============================================================================
     const shell: (input: ShellInput) => Effect.Effect<MessageV2.WithParts> = Effect.fn("SessionPrompt.shell")(
       function* (input: ShellInput) {
         return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input))
       },
     )
 
+    // ============================================================================
+    // command：处理斜杠命令（如 /goal、/compact）的对外入口。
+    // 流程：按名字查命令定义 → 找不到就报「命令不存在」并列出可用命令 → 解析目标 agent →
+    // 对内置命令（如 /goal 设置或清除会话级停止条件）做特殊处理，其余命令展开成模板后
+    // 转成一次普通 prompt(...) 执行。
+    // ============================================================================
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
       yield* elog.info("command", { sessionID: input.sessionID, command: input.command, agent: input.agent })
       const cmd = yield* commands.get(input.command)
