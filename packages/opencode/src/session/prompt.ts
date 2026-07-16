@@ -3427,12 +3427,14 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           const hasToolCalls =
             lastAssistantMsg?.parts.some((part) => part.type === "tool" && !part.metadata?.providerExecuted) ?? false
 
+          // ==== 预检查阶段：先看「上一圈已有的助手消息」，能提前判定就不白调一次模型 ====
           if (
             lastAssistant?.finish === "length" &&
             !hasToolCalls &&
             lastUser.id < lastAssistant.id &&
             (yield* autoContinueOutputLength({ lastUser, assistant: lastAssistant }))
           ) {
+            // 场景：上一圈的回答撞 token 上限被截断（§2.1）。已注入「接着写」提醒 → 再转一圈续写。
             continue
           }
 
@@ -3444,21 +3446,25 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               parts: lastAssistantMsg?.parts ?? [],
             })
             if (classification.type === "filtered") {
+              // 场景：上一圈被内容安全过滤（§4）。终态，重发只会再被过滤 → 写错误、收工。
               yield* writeContentFilterError({ assistant: lastAssistant })
               yield* slog.info("exiting loop", { classification: classification.type })
               break
             }
             if (classification.type === "failed") {
+              // 场景：上一圈模型报错（§4）。终态 → 写错误、收工。
               yield* writeModelError({ assistant: lastAssistant, reason: classification.reason })
               yield* slog.info("exiting loop", { classification: classification.type, reason: classification.reason })
               break
             }
             if (classification.type === "text-tool-call") {
+              // 场景：上一圈把工具调用写成了纯文本（§2.3）。能重试则再转一圈；重试用尽则收工。
               if (yield* autoRetryTextToolCall({ lastUser, assistant: lastAssistant })) continue
               yield* slog.info("exiting loop", { classification: classification.type })
               break
             }
             if (classification.type === "think-only" || classification.type === "invalid") {
+              // 场景：上一圈只思考没给答案 / 空输出（§2.2）。能续写则再转一圈；续写用尽则收工。
               const reason = classification.type === "invalid" ? classification.reason : "think-only"
               if (yield* autoContinueInvalidOutput({ lastUser, assistant: lastAssistant, reason })) continue
               yield* slog.info("exiting loop", { classification: classification.type })
@@ -3467,6 +3473,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             if (classification.type === "final" && classification.degraded)
               yield* slog.warn("degraded final on abnormal finish", { finish: lastAssistant.finish })
             if (classification.type !== "continue") {
+              // 场景：上一圈已是可收工的终态（final 等）。但收工前先过两道否决闸门（§5）：
+              // 还有未完成 task → continue；goal 未达成 → continue；都放行才真正收工。
               if (yield* taskGate(lastUser)) continue
               if (yield* goalGate(lastUser)) continue
               yield* slog.info("exiting loop", { classification: classification.type })
@@ -3555,6 +3563,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
           const task = tasks.pop()
 
           if (task?.type === "subtask") {
+            // 场景：这一圈要派生一个子 agent 去干预定的子任务。派完就再转一圈（不在本圈调模型）。
             yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
             continue
           }
@@ -3579,8 +3588,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             // 的总线订阅来失效——见 `compaction.ts:468` 的 publish 与 `cron-bridge.ts`
             // 的 subscribe 这一对。既覆盖这里的用户 `/compact` 路径，也覆盖
             // compaction.create 里的溢出边界路径。
-            if (result === "stop") break
-            continue
+            // 场景：这一圈是压缩边界（用户 /compact 或自动溢出插入的标记），已执行历史摘要压缩。
+            if (result === "stop") break // 压缩后判定该收工 → 收工
+            continue // 否则用瘦身后的上下文再转一圈
           }
 
           // 高上下文压力下的内存刷写提示。
@@ -3740,6 +3750,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               // 上下文为下一次迭代的流被释放出来。跳过下一次溢出检查，让模型能在裁剪后的
               // 上下文上作答。
               skipOverflowCheck = true
+              // 场景：子 agent 上下文溢出（§3.2），已做有损压缩 → 用瘦身后的上下文再转一圈。
               continue
             }
 
@@ -3760,6 +3771,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             })
             if (inserted) {
               skipOverflowCheck = true
+              // 场景：主 agent 溢出（§3.2），已插入 checkpoint 边界 → 下一圈从 checkpoint 重建后再跑。
               continue
             }
 
@@ -3775,6 +3787,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               })
               .pipe(Effect.ignore)
             skipOverflowCheck = true
+            // 场景：主 agent 溢出但无 checkpoint 可用，回退到有损压缩 → 再转一圈。
             continue
           }
           skipOverflowCheck = false
@@ -3903,6 +3916,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 yield* actorRegistry
                   .updateStatus(sessionID, lastUser.agentID!, { status: "idle", lastOutcome: "failure", lastError: "missing fork context" })
                   .pipe(Effect.ignore)
+                // 场景：fork 子 agent 的冻结快照丢了（§4）→ 标记 actor 失败、收工（下轮由 prune 重派生）。
                 return "break" as const
               }
               const ownNew = msgs.filter(
@@ -3954,6 +3968,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   },
                   {},
                 )
+                // 场景：插件在 session.userQuery.pre 里取消了这一步（§4）→ 写取消错误、收工。
                 return "break" as const
               }
               const result = yield* handle
@@ -4007,19 +4022,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   ),
                 )
 
+              // ==== fork 分支：把这一步模型返回归纳成 outcome（break/continue）====
               if (
                 result === "continue" &&
                 (yield* autoContinueOutputLength({ lastUser, assistant: handle.message }))
               ) {
+                // 场景：输出被 token 截断（§2.1），已注入续写提醒 → continue。
                 return "continue" as const
               }
 
               if (result === "text-repeat") {
+                // 场景：流内复读（§2.5）。能救 continue，救不动 break。
                 if (yield* handleTextRepeat({ lastUser })) return "continue" as const
                 return "break" as const
               }
 
               if (structured !== undefined) {
+                // 场景：拿到了要求的结构化输出（§4）→ 存下、收工。
                 handle.message.structured = structured
                 handle.message.finish = handle.message.finish ?? "stop"
                 yield* sessions.updateMessage(handle.message)
@@ -4031,8 +4050,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               // within budget, hard-halt once exceeded. A non-empty step returns
               // "none" and falls through to normal classification.
               const forkEmptyStep = yield* handleEmptyStep({ lastUser, assistant: handle.message })
-              if (forkEmptyStep === "halt") return "break" as const
-              if (forkEmptyStep === "continue") return "continue" as const
+              if (forkEmptyStep === "halt") return "break" as const // 场景：空调用循环超限（§2.6）→ 硬熔断收工
+              if (forkEmptyStep === "continue") return "continue" as const // 场景：空步骤可救，已提醒 → continue
 
               const forkClassification = classifyAssistantStep({
                 phase: "after-process",
@@ -4042,18 +4061,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 processResult: result,
               })
               if (forkClassification.type === "filtered") {
+                // 场景：被内容安全过滤（§4）→ 写错误、收工。
                 yield* writeContentFilterError({ assistant: handle.message })
                 return "break" as const
               }
               if (forkClassification.type === "failed") {
+                // 场景：模型报错（§4）→ 写错误、收工。
                 yield* writeModelError({ assistant: handle.message, reason: forkClassification.reason })
                 return "break" as const
               }
               if (forkClassification.type === "text-tool-call") {
+                // 场景：工具调用写成了纯文本（§2.3）。能重试 continue，用尽 break。
                 if (yield* autoRetryTextToolCall({ lastUser, assistant: handle.message })) return "continue" as const
                 return "break" as const
               }
               if (forkClassification.type !== "continue" && !handle.message.error && format.type === "json_schema") {
+                // 场景：要 json_schema 但没产出结构化输出（§2.4）。能重试 continue，用尽 break。
                 if (yield* autoRetryStructuredOutput({ lastUser, assistant: handle.message }))
                   return "continue" as const
                 return "break" as const
@@ -4063,6 +4086,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 (forkClassification.type === "think-only" || forkClassification.type === "invalid") &&
                 format.type !== "json_schema"
               ) {
+                // 场景：只思考没答案 / 空输出（§2.2）。能续写 continue，用尽 break。
                 const reason =
                   forkClassification.type === "invalid" ? forkClassification.reason : "think-only"
                 if (yield* autoContinueInvalidOutput({ lastUser, assistant: handle.message, reason }))
@@ -4072,7 +4096,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
               if (forkClassification.type === "final" && forkClassification.degraded)
                 yield* slog.warn("degraded final on abnormal finish", { finish: handle.message.finish })
-              if (result === "stop") return "break" as const
+              if (result === "stop") return "break" as const // 场景：模型正常说完（§4）→ 收工
+              // 场景：子 agent 上下文溢出（§3.2）→ 按 actor 做有损压缩，随后 continue。
               // fork agent 始终是子 agent（lastUser.agentID 已设置）；溢出时使用
               // 按 actor 的 compaction（与非 fork 的子 agent 路径相同）。
               if (!isBoundedComputation && result === "overflow") {
@@ -4087,6 +4112,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   })
                   .pipe(Effect.ignore)
               }
+              // 场景：模型调了工具（默认路径）→ 把工具结果喂回，再转一圈。
               return "continue" as const
             }
 
@@ -4227,19 +4253,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               ),
             )
 
+            // ==== 主 agent 分支：把这一步模型返回归纳成 outcome（break/continue）====
             if (
               result === "continue" &&
               (yield* autoContinueOutputLength({ lastUser, assistant: handle.message }))
             ) {
+              // 场景：输出被 token 截断（§2.1），已注入续写提醒 → continue。
               return "continue" as const
             }
 
             if (result === "text-repeat") {
+              // 场景：流内复读（§2.5）。能救 continue，救不动 break。
               if (yield* handleTextRepeat({ lastUser })) return "continue" as const
               return "break" as const
             }
 
             if (structured !== undefined) {
+              // 场景：拿到了要求的结构化输出（§4）→ 存下、收工。
               handle.message.structured = structured
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
@@ -4251,8 +4281,8 @@ NOTE: At any point in time through this workflow you should feel free to ask the
             // within budget, hard-halt once exceeded. A non-empty step returns
             // "none" and falls through to normal classification.
             const emptyStep = yield* handleEmptyStep({ lastUser, assistant: handle.message })
-            if (emptyStep === "halt") return "break" as const
-            if (emptyStep === "continue") return "continue" as const
+            if (emptyStep === "halt") return "break" as const // 场景：空调用循环超限（§2.6）→ 硬熔断收工
+            if (emptyStep === "continue") return "continue" as const // 场景：空步骤可救，已提醒 → continue
 
             const classification = classifyAssistantStep({
               phase: "after-process",
@@ -4262,18 +4292,22 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               processResult: result,
             })
             if (classification.type === "filtered") {
+              // 场景：被内容安全过滤（§4）→ 写错误、收工。
               yield* writeContentFilterError({ assistant: handle.message })
               return "break" as const
             }
             if (classification.type === "failed") {
+              // 场景：模型报错（§4）→ 写错误、收工。
               yield* writeModelError({ assistant: handle.message, reason: classification.reason })
               return "break" as const
             }
             if (classification.type === "text-tool-call") {
+              // 场景：工具调用写成了纯文本（§2.3）。能重试 continue，用尽 break。
               if (yield* autoRetryTextToolCall({ lastUser, assistant: handle.message })) return "continue" as const
               return "break" as const
             }
             if (classification.type !== "continue" && !handle.message.error && format.type === "json_schema") {
+              // 场景：要 json_schema 但没产出结构化输出（§2.4）。能重试 continue，用尽 break。
               if (yield* autoRetryStructuredOutput({ lastUser, assistant: handle.message })) return "continue" as const
               return "break" as const
             }
@@ -4282,6 +4316,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
               (classification.type === "think-only" || classification.type === "invalid") &&
               format.type !== "json_schema"
             ) {
+              // 场景：只思考没答案 / 空输出（§2.2）。能续写 continue，用尽 break。
               const reason = classification.type === "invalid" ? classification.reason : "think-only"
               if (yield* autoContinueInvalidOutput({ lastUser, assistant: handle.message, reason }))
                 return "continue" as const
@@ -4290,7 +4325,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
 
             if (classification.type === "final" && classification.degraded)
               yield* slog.warn("degraded final on abnormal finish", { finish: handle.message.finish })
-            if (result === "stop") return "break" as const
+            if (result === "stop") return "break" as const // 场景：模型正常说完（§4）→ 收工
             if (!isBoundedComputation && result === "overflow") {
               // 子 agent 溢出 → 按 actor 的 compaction。插入一个用子 agent 的 agent_id
               // 标记的边界；下一次 runLoop 迭代将看到裁剪后的上下文（filterCompactedEffect
@@ -4308,6 +4343,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                     agentID: lastUser.agentID,
                   })
                   .pipe(Effect.ignore)
+                // 场景：子 agent provider 信号溢出（§3.2）→ 有损压缩后 continue。
                 return "continue" as const
               }
 
@@ -4326,6 +4362,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 agent: lastUser.agent,
                 model: { providerID: model.providerID, id: model.id },
               })
+              // 场景：主 agent 溢出（§3.2），已插入 checkpoint 边界 → 下一圈从 checkpoint 重建。
               if (inserted2) return "continue" as const
 
               // F39：没有 checkpoint——回退到 compaction（LLM 驱动的有损摘要）。
@@ -4339,7 +4376,9 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                   agentID: lastUser.agentID,
                 })
                 .pipe(Effect.ignore)
+              // （主 agent 溢出但无 checkpoint 可用：已回退到有损压缩，落到下面的 continue）
             }
+            // 场景：模型调了工具（默认路径），或溢出已处理完 → 把结果喂回，再转一圈。
             return "continue" as const
           }).pipe(Effect.ensuring(instruction.clear(handle.message.id)))
 
@@ -4371,6 +4410,7 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                       message: `Text loop detected: model repeated the same output ${TEXT_LOOP_TRIGGER_COUNT} times after ${TEXT_LOOP_MAX_RECOVERY} recovery attempts. Session terminated.`,
                     }).toObject(),
                   })
+                  // 场景：跨步文本循环（§2.7）恢复次数已用尽，模型仍在绕圈 → 发错误、收工。
                   break
                 }
                 const recoveryText =
@@ -4398,19 +4438,23 @@ NOTE: At any point in time through this workflow you should feel free to ask the
                 textLoopRecoveryAttempts++
                 textLoopBuffer.length = 0
                 yield* slog.info("text loop: recovery injected", { attempt: textLoopRecoveryAttempts })
+                // 场景：跨步文本循环（§2.7），已注入换思路提醒 → 再转一圈让模型改变输出。
                 continue
               }
             }
           }
 
+          // ==== 本圈收尾：根据这一步归纳出的 outcome 决定收工还是再转一圈 ====
           if (outcome === "break") {
+            // 场景：这一步想收工（模型说完 / 终态 / 各类重试用尽）。
             // A hard halt is terminal — skip the ReAct re-entry gates so a
             // degraded model can't be re-driven into the same empty loop.
-            if (hardHalt) break
-            if (yield* taskGate(lastUser)) continue
-            if (yield* goalGate(lastUser)) continue
-            break
+            if (hardHalt) break // 硬熔断（§2.6）：直接收工，跳过下面两道否决闸门
+            if (yield* taskGate(lastUser)) continue // 还有未完成 task（§5.1）→ 被否决，强制再转一圈
+            if (yield* goalGate(lastUser)) continue // goal 未达成（§5.2）→ 被否决，强制再转一圈
+            break // 两道闸门都放行 → 真正收工
           }
+          // 场景：这一步是 continue（模型调了工具要喂回结果 / 触发了某个重试）→ 再转一圈。
           continue
         }
 
@@ -4445,6 +4489,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
         // parent so the event-driven model holds. Gated to background peers and
         // excludes system subagents (checkpoint-writer/dream/distill). The flag
         // is never set on the spawn turn, so turn 1 is not double-notified.
+        // 唤醒对等执行单元完成信号。forkWork.notify 仅封装首轮（创建实例）执行流程；
+        // 若常驻后台对等单元完成后续由消息队列触发的执行流程，若无本段逻辑，它会直接静默进入空闲状态，
+        // 迫使调度器持续轮询。当本次循环经由消息队列通路（notifyParentOnComplete）被唤醒时，
+        // 向父节点同步发送与 forkWork 一致的 actor_notification 通知，以此保障事件驱动模型正常运行。
+        // 该逻辑仅对后台对等单元生效，系统子代理（检查点写入器、推理单元、蒸馏单元）不触发此逻辑。
+        // 创建实例首轮流程不会置位该标记，因此首轮执行不会重复发送通知。
         if (notifyParentOnComplete && agentID && session.parentID) {
           const actor = yield* actorRegistry.get(sessionID, agentID)
           if (
@@ -4542,6 +4592,12 @@ NOTE: At any point in time through this workflow you should feel free to ask the
       // turn). If no usable checkpoint exists yet, tell the user rather than
       // silently doing nothing — the first checkpoint has to be produced by
       // normal turns before there is anything to rebuild from.
+      // /rebuild 命令——基于最新检查点，手动重建当前对话上下文。
+      // 该逻辑复用与自动溢出流程完全一致的 rebuildFromCheckpoint 处理步骤（逻辑、边界条件均相同），
+      // 因此用户手动触发重建的效果与自动重建完全一致：会在水位标记处插入检查点分界，
+      // 分界之后的近期消息完整保留，分界之前的历史消息将在下一轮执行时压缩为检查点摘要。
+      // 若当前不存在可用的检查点，会向用户返回提示，而非静默无响应；
+      // 首个检查点必须经由常规对话轮次生成后，才具备重建的数据源。
       if (input.command === Command.Default.REBUILD) {
         const msgs = yield* sessions.messages({ sessionID: input.sessionID, agentID: "main" })
         const lastUser = msgs.findLast((m) => m.info.role === "user")
