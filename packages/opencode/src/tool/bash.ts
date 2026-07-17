@@ -905,6 +905,9 @@ export const BashTool = Tool.define(
       let expired = false // Whether the command was killed by timeout / 命令是否因超时被杀
       let aborted = false // Whether the command was killed by user abort / 命令是否因用户取消被杀
 
+      // Push an empty preview immediately so the UI renders the command as "running"
+      // before any output arrives.
+      // 先推一个空预览，让 UI 在任何输出到来之前就把命令渲染成"运行中"。
       yield* ctx.metadata({
         metadata: {
           output: "",
@@ -912,6 +915,10 @@ export const BashTool = Tool.define(
         },
       })
 
+      // Run the child process inside a scope and resolve to its exit code (or null when it
+      // was killed by abort/timeout). Everything spawned here is torn down when the scope ends.
+      // 在一个 scope 内运行子进程，解析出退出码（被取消/超时杀掉时为 null）。这里派生的一切
+      // 都会在 scope 结束时被清理。
       const code: number | null = yield* Effect.scoped(
         Effect.gen(function* () {
           // Spawn the child process; the enclosing scope guarantees it is cleaned up.
@@ -946,6 +953,11 @@ export const BashTool = Tool.define(
                 sink?.write(chunk)
               } else {
                 full += chunk
+                // Inline buffer exceeded the byte budget: spill everything accumulated so
+                // far to a truncation file, switch subsequent writes to that file's stream,
+                // mark truncated, then refresh the UI preview.
+                // 内联缓冲超过字节预算：把目前累积的内容溢写到截断文件，后续写入切到该文件的流，
+                // 标记为已截断，然后刷新 UI 预览。
                 if (Buffer.byteLength(full, "utf-8") > bytes) {
                   return trunc.write(full).pipe(
                     Effect.andThen((next) =>
@@ -1026,6 +1038,11 @@ export const BashTool = Tool.define(
         )
       }
       if (aborted) meta.push("User aborted the command")
+      // Rebuild the retained output from the rolling buffer, then take a bounded tail slice.
+      // If that tail itself had to cut content and nothing was spilled yet, write the full
+      // raw output to a truncation file so the model can still reach it.
+      // 从滚动缓冲重建保留下来的输出，再取一段有界的尾部切片。若该尾部本身发生了裁剪、且此前
+      // 还没溢写过，就把完整原始输出写入截断文件，让模型仍能取到。
       const raw = list.map((item) => item.text).join("")
       const end = tail(raw, lines, bytes)
       if (end.cut) cut = true
@@ -1038,6 +1055,8 @@ export const BashTool = Tool.define(
       // involved — once the output spills to a truncation file, the on-disk
       // archive stays raw and cleaning is skipped to keep the inline preview
       // consistent with the archive.
+      // 省 token 的后处理清洗：去 ANSI 转义 / 折叠进度条 / 脱敏密钥 / 省略超长行。仅在没有落盘
+      // 时应用——一旦输出溢写到截断文件，磁盘存档保持原始、跳过清洗，以保证内联预览与存档一致。
       const cleaned =
         !file && Flag.MIMOCODE_EXPERIMENTAL_TOKEN_EFFICIENCY
           ? BashTokenEfficient.clean(end.text, { command: input.command })
@@ -1053,6 +1072,8 @@ export const BashTool = Tool.define(
       // Heuristic (shape-based) pipeline runs AFTER the common pipeline and
       // only when both flags are on. Same never-worse contract — a shape that
       // doesn't shrink the bytes is discarded.
+      // 基于"形状"的启发式管线在通用清洗之后运行，且仅当两个开关都打开时。同样遵循"绝不更差"
+      // 约定——如果某种形状没能减小字节数，就丢弃它。
       const heuristic =
         !file &&
         Flag.MIMOCODE_EXPERIMENTAL_TOKEN_EFFICIENCY &&
@@ -1112,6 +1133,10 @@ export const BashTool = Tool.define(
         )
       }
 
+      // Assemble the final result: `metadata` feeds the UI (live preview + exit code +
+      // truncation info), while `output` is the full text handed back to the model.
+      // 组装最终结果：`metadata` 供 UI 使用（实时预览 + 退出码 + 截断信息），`output` 则是交回
+      // 给模型的完整文本。
       return {
         title: input.description,
         metadata: {
@@ -1214,6 +1239,9 @@ export const BashTool = Tool.define(
                 }
               }
 
+              // Non-interactive path: execute via the streaming `run` above and return its
+              // result (spawn + live output + abort/timeout race + truncation).
+              // 非交互路径：经上面的流式 `run` 执行并返回其结果（spawn + 实时输出 + 取消/超时竞速 + 截断）。
               return yield* run(
                 {
                   shell,
